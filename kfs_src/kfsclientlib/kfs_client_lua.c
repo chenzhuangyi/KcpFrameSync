@@ -1,151 +1,10 @@
 //=====================================================================
-//
-// kcpframesynclib_client — KCP 帧同步库的客户端独立绑定（Lua 5.4）
-//
-// 职责：客户端侧的单会话帧同步通道。
-//   - 客户端绑定本机 UDP 端口，创建一条到服务器的 KCP 会话（conv）。
-//   - 上报输入：send_input(frame_id, data) → 打 CMD_INPUT 包发往服务器。
-//   - 收广播：  recv_broadcast() → 收服务器下发的 CMD_BROADCAST 帧，
-//               返回 (frame_id, 广播负载, 对账ok)；ok=false 表示该帧全员
-//               输入哈希与服务器不一致（不同步告警）。
-//   - 后台驱动线程自动驱动 KCP，无需手工 room:update()。
-//
-// 复用共享底层：
-//   - net.c（net.h）   : UDP socket / 接收线程 / 原始包收发（点对点）
-//   - frame.c(frame.h) : 带 type 的帧协议编解码（frame_encode2 / frame_decode2）
-//   - kcp/ikcp.c       : KCP 可靠传输
-//
-// 与服务器库（kcpframesynclib.c）的关系：
-//   - 服务器库管理多房间、收集全员输入并广播；
-//   - 本库只负责单个客户端会话的收发，二者通过 CMD_INPUT / CMD_BROADCAST
-//     协议通信，客户端 conv 须与服务器 add_player(conv, ...) 一致。
-//
-// 依赖：Lua 5.4 头文件、net.c、kcp/ikcp.c、-lpthread
-// 编译：见 Makefile；产物 kcpframesynclib_client.so
-//
-// 用法（Lua）：
-//   local fs = require("kcpframesynclib_client")
-//   local c, err = fs.new(11000, 11)          -- 本机端口, conv（与服务器 add_player 一致）
-//   if not c then error(err) end
-//   c:setpeer("127.0.0.1", 10500)             -- 连服务器
-//   c:nodelay(1, 10, 2, 1)
-//   local fid = 0
-//   while true do
-//       c:send_input(fid, "move:1,2")          -- 上报输入
-//       local bfid, data = c:recv_broadcast()  -- 收服务器广播
-//       if bfid then print(bfid, data) end
-//       fid = fid + 1
-//   end
-//   c:close()
-//
+// kfs_client_lua.c — 客户端库 Lua 绑定层
+//   fs.new / setpeer / join / 输入·就绪·广播·状态·追帧 / 心跳 / 参数 / 生命周期
+//   底层逻辑见 kfs_client_core.c；结构定义见 kfs_client.h。
 //=====================================================================
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdint.h>
+#include "kfs_client.h"
 
-#include <pthread.h>
-#include <time.h>
-#include <arpa/inet.h>          /* inet_pton */
-
-#include "net.h"
-#include "frame.h"
-#include "kcp/ikcp.h"
-#include <lua.h>
-#include <lauxlib.h>
-#include <lualib.h>
-
-//---------------------------------------------------------------------
-// 客户端对象（单会话）
-//---------------------------------------------------------------------
-typedef struct kfs_client {
-    kfs_net *net;               // 底层网络（net.c）
-    ikcpcb  *kcp;               // 到服务器的 KCP 会话
-    uint32_t conv;              // KCP conv（与服务器 add_player 一致）
-    int      closed;            // 1=已关闭
-    int      joined;            // 已收到服务器 JOIN 应答（无论成败）
-    int      join_ok;           // JOIN 是否成功（1=已登记进房间）
-
-    pthread_mutex_t lock;       // 保护 net/kcp/closed
-    pthread_t   dthread;        // 后台驱动线程
-    int         drunning;       // 驱动线程运行标志
-    int         djoined;        // 驱动线程已 join
-
-    int         heartbeat_ms;   // 自动心跳间隔（0=不启用）；驱动线程按此补发 HEARTBEAT
-    uint64_t    last_heartbeat_ms;  // 上次发心跳的时间（单调时钟 ms）
-} kfs_client;
-
-// 当前单调时钟毫秒数
-static IUINT32 kfs_now_ms(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (IUINT32)((uint64_t)ts.tv_sec * 1000u
-                     + (uint64_t)ts.tv_nsec / 1000000u);
-}
-
-// KCP output 回调：KCP 产出 UDP 数据 → 发往服务器（点对点，net_send）
-static int kfs_c_output(const char *buf, int len, ikcpcb *kcp, void *user)
-{
-    kfs_client *c = (kfs_client *)user;
-    (void)kcp;
-    if (c == NULL || c->net == NULL)
-        return -1;
-    return net_send(c->net, buf, len);
-}
-
-// 后台驱动线程：收包喂 KCP + 驱动 KCP
-static void *kfs_drive_thread(void *arg)
-{
-    kfs_client *c = (kfs_client *)arg;
-    char buf[KFS_NET_MAX_PKT];
-    struct sockaddr_in from;
-    struct timespec ts = {0, 1 * 1000 * 1000};   // 1ms 节流
-    IUINT32 now;
-    int rcv;
-
-    while (1) {
-        pthread_mutex_lock(&c->lock);
-        if (c->closed || c->net == NULL) {
-            pthread_mutex_unlock(&c->lock);
-            break;
-        }
-        now = kfs_now_ms();
-        while ((rcv = net_recv(c->net, buf, KFS_NET_MAX_PKT, &from)) > 0) {
-            uint32_t m;
-            if (rcv >= 5) {
-                memcpy(&m, buf, 4);
-                if (m == KFS_HANDSHAKE_MAGIC) {
-                    c->joined = 1;                  // 裸握手应答
-                    c->join_ok = (buf[4] == 0);
-                    continue;
-                }
-            }
-            if (c->kcp)
-                ikcp_input(c->kcp, buf, (long)rcv);
-        }
-        if (c->kcp)
-            ikcp_update(c->kcp, now);
-        // 自动心跳：超过 heartbeat_ms 未发则补发（走 KCP 可靠传输，
-        // 供服务器基于 last_active 做掉线判定）。心跳为空负载 HEARTBEAT 帧。
-        if (c->kcp && c->heartbeat_ms > 0 &&
-            (uint64_t)now - c->last_heartbeat_ms > (uint64_t)c->heartbeat_ms) {
-            char hb[KFS_FRAME_MAX_TOTAL];
-            int th = frame_encode2(hb, (int)sizeof(hb), KFS_CMD_HEARTBEAT, 0, NULL, 0);
-            if (th > 0) {
-                ikcp_send(c->kcp, hb, th);
-                c->last_heartbeat_ms = now;
-            }
-        }
-        pthread_mutex_unlock(&c->lock);
-        nanosleep(&ts, NULL);
-    }
-    return NULL;
-}
-
-//---------------------------------------------------------------------
-// 对象检查
-//---------------------------------------------------------------------
 static kfs_client *check_client(lua_State *L, int idx)
 {
     return (kfs_client *)luaL_checkudata(L, idx, "kcpframesynclib_client");
@@ -169,10 +28,6 @@ static int kfs_closed(lua_State *L);
 static int kfs_close(lua_State *L);
 static int kfs_gc(lua_State *L);
 
-//---------------------------------------------------------------------
-// 生命周期
-//---------------------------------------------------------------------
-// new(port, conv) → 客户端对象
 static int kfs_new(lua_State *L)
 {
     lua_Integer port = luaL_checkinteger(L, 1);
@@ -659,8 +514,9 @@ static const luaL_Reg kfs_client_module[] = {
 #define KFS_API
 #endif
 
-KFS_API int luaopen_kcpframesynclib_client(lua_State *L)
+KFS_API int luaopen_kfsclientlib(lua_State *L)
 {
     luaL_newlib(L, kfs_client_module);
     return 1;
 }
+

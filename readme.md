@@ -1,9 +1,9 @@
-# kcpframesynclib — KCP 帧同步库（服务器 + 客户端两个 .so）
+# KCP 帧同步库 — kfsserverlib / kfsclientlib（服务器 + 客户端两个 .so）
 
 把 KCP 帧同步封装成 Lua 层可直接 `require` 的两个 C 共享库：
 
-- **服务器库** `kcpframesynclib.so`：由 C 库驱动所有房间，处理客户端协议包，**收集后转发给同房间内所有客户端**。
-- **客户端库** `kcpframesynclib_client.so`：客户端独立库，单会话连服务器，上报输入、收服务器广播。
+- **服务器库** `kfsserverlib.so`：由 C 库驱动所有房间，处理客户端协议包，**收集后转发给同房间内所有客户端**。
+- **客户端库** `kfsclientlib.so`：客户端独立库，单会话连服务器，上报输入、收服务器广播。
 
 输入帧走 **KCP 可靠传输**；按线上帧同步标准实现：
 - **输入提前量窗口**：客户端把输入补发到"当前帧 + advance_frames"，服务器从玩家超前缓冲按帧号取全员输入推进；
@@ -22,32 +22,42 @@
 ## 结构
 
 ```
-kcpframesynclib/
-├── kcp/                        kcp 源码（ikcp.c / ikcp.h）
-├── lua/
-│   └── lua-5.4.8/              Lua 5.4 C 源码（自包含编译用）
-├── kcpframesynclib/            帧同步库源码（三层分离，双库共享底层）
-│   ├── net.c / net.h           网络层：UDP socket + 接收线程 + 原始包收发
-│   │                           （含 net_send_to，支持多人广播）
-│   ├── frame.c / frame.h       帧协议层：带 type 的帧编解码（CMD_INPUT/BROADCAST…）
-│   ├── kcpframesynclib.c       服务器库：多玩家房间 + 收集转发 + 超时兜底
-│   ├── kcpframesynclib_client.c 客户端库：单会话连服务器
-│   └── Makefile                构建 → kcpframesynclib.so + kcpframesynclib_client.so
-lua_server/
-├── config                      配置（udp port / 房间 / 帧率 / conv / 客户端）
-├── server.lua                  服务器测试脚本（多玩家房间）
-├── client.lua                  客户端测试脚本（用客户端库）
-└── framesync.lua               旧点对点高层封装（仅旧点对点场景）
+KcpFrameSync/
+├── kfs_src/
+│   ├── common/                 共享底层（网络 / 帧 / 工具）
+│   │   ├── net.c / net.h       网络层：UDP socket + 接收线程 + 原始包收发
+│   │   │                       （含 net_send_to，支持多人广播）
+│   │   ├── frame.c / frame.h   帧协议层：带 type 的帧编解码（CMD_INPUT/BROADCAST…）
+│   │   └── kfs_common.h / kfs_util.c  公共工具（kfs_now_ms / kfs_rng_next，双库共享）
+│   ├── kfsserverlib/           服务器库（底层逻辑 + Lua 绑定 分离）
+│   │   ├── kfs_server.h        结构定义 + 跨模块函数声明
+│   │   ├── kfs_core.c          底层逻辑：netref 句柄 / 房间收集转发 / 驱动线程 / 服务器 C 层
+│   │   └── kfs_lua.c           Lua 绑定：fs.new / conn / 点对点 room / srvroom / luaopen
+│   ├── kfsclientlib/           客户端库（底层逻辑 + Lua 绑定 分离）
+│   │   ├── kfs_client.h        客户端对象 + 跨模块声明
+│   │   ├── kfs_client_core.c   底层逻辑：KCP output 回调 + 驱动线程 + 自动心跳
+│   │   └── kfs_client_lua.c    Lua 绑定：new / setpeer / join / 输入·广播·追帧 / luaopen
+│   ├── third/                  第三方源码
+│   │   ├── kcp/                kcp 源码（ikcp.c / ikcp.h）
+│   │   └── lua-5.4.8/          Lua 5.4 C 源码（自包含编译用）
+│   └── Makefile                构建 → kfsserverlib.so + kfsclientlib.so
+├── lua_test/                   测试脚本（用两个 .so）
+│   ├── server.lua              服务器测试脚本（多玩家房间）
+│   ├── client.lua              客户端测试脚本（用客户端库）
+│   ├── config                  配置（udp port / 房间 / 帧率 / conv / 客户端）
+│   └── stop_all.sh             停止测试进程脚本
+└── readme.md
 ```
 
 ## 架构：三层分离 + 双库
 
 | 层 | 文件 | 职责 | 依赖 |
 |----|------|------|------|
-| 网络层 | `net.c` | UDP socket、接收线程、原始包队列、`net_send`/`net_send_to` | 无 |
-| 帧协议层 | `frame.c` | 带 type 的帧编解码：`[type 1B][frame_id 4B][len 2B][data]` | 无 |
-| 服务器库 | `kcpframesynclib.c` | 多玩家房间、收集全员输入、广播、超时兜底 | Lua 5.4 |
-| 客户端库 | `kcpframesynclib_client.c` | 单会话连服务器，send_input / recv_broadcast | Lua 5.4 |
+| 网络层（common） | `kfs_src/common/net.c` | UDP socket、接收线程、原始包队列、`net_send`/`net_send_to` | 无 |
+| 帧协议层（common） | `kfs_src/common/frame.c` | 带 type 的帧编解码：`[type 1B][frame_id 4B][len 2B][data]` | 无 |
+| 公共工具（common） | `kfs_src/common/kfs_util.c` | `kfs_now_ms` / `kfs_rng_next`（双库共享） | 无 |
+| 服务器库 | `kfs_src/kfsserverlib/kfs_core.c` + `kfs_lua.c` | 底层逻辑（netref/房间收集/驱动/服务器C层）与 Lua 绑定分离 | Lua 5.4 |
+| 客户端库 | `kfs_src/kfsclientlib/kfs_client_core.c` + `kfs_client_lua.c` | 底层逻辑（KCP output/驱动/自动心跳）与 Lua 绑定分离 | Lua 5.4 |
 
 **核心概念升级**：旧代码里「房间 = 一个 conv = 点对点」；新架构里
 **conv = 玩家会话，房间 = 多玩家集合**。一个服务器端口承载多个房间，
@@ -89,25 +99,26 @@ JOIN 应答：[ magic 4B ][ result 1B ]（0成功 1不存在 2满 3conv冲突 4�
 ## 构建（Linux 服务器，自包含）
 
 ```bash
-cd kcpframesynclib
-make            # 产出 kcpframesynclib.so + kcpframesynclib_client.so
+# kfs_src 目录下
+cd kfs_src
+make            # 产出 kfsserverlib.so + kfsclientlib.so
 sudo make install   # 两个 .so 都安装到 /usr/local/lib/lua/5.4/
 ```
 
-Windows + Zig 交叉编译（先设 ZIG 路径）：
+Windows + Zig 交叉编译（先设 ZIG 路径，在 kfs_src 目录下）：
 
 ```bash
 make zig
 ```
 
-## 服务器用法（kcpframesynclib）
+## 服务器用法（kfsserverlib）
 
 ```lua
-local fs = require("kcpframesynclib")
+local fs = require("kfsserverlib")
 local conn, err = fs.new(10500, 20)             -- 绑定 UDP，启动驱动线程；frame_rate=20
--- new_room(room_id, max_player, timeout_ms, token, ttl_ms, idle_timeout_ms, players)
+-- new_room(room_id, timeout_ms, token, ttl_ms, idle_timeout_ms, players)
 local players = { [11] = true, [12] = true }   -- 初始玩家 id 表（key 即 conv）
-local room, tokens = conn:new_room(100, 4, 500, 0, 0, 2000, players)
+local room, tokens = conn:new_room(100, 500, 0, 0, 2000, players)
 --   校验：初始玩家数 ≤ max_player，否则报错；初始玩家预登记为 INIT（等 JOIN）
 --   返回 tokens = {[11]=tk1, [12]=tk2}（经安全通道分发给对应客户端）
 --   token:          房间级 token（0=不校验；per-player 未登记该 conv 时回退）
@@ -124,7 +135,7 @@ local room, tokens = conn:new_room(100, 4, 500, 0, 0, 2000, players)
 --     此阶段无帧包，玩家连接靠心跳保活，心跳超时（idle_timeout）标记掉线。
 --   phase=1 对局：业务层判定全员就绪后调 room:start()，才开始收集推帧。
 local players = { [11] = true, [12] = true }
-local room, tokens = conn:new_room(100, 4, 500, 0, 0, 2000, players)
+local room, tokens = conn:new_room(100, 500, 0, 0, 2000, players)
 while true do
     if room:get_phase() == 0 and room:ready_count() >= 2 then
         room:start()                 -- 业务层通知房间开始同步推帧
@@ -133,10 +144,10 @@ while true do
 end
 ```
 
-## 客户端用法（kcpframesynclib_client）
+## 客户端用法（kfsclientlib）
 
 ```lua
-local fs = require("kcpframesynclib_client")
+local fs = require("kfsclientlib")
 local c = fs.new(0, 11)                         -- 端口 0=系统分配；conv 唯一标识
 c:setpeer("127.0.0.1", 10500)                   -- 指定服务器
 local ok, why = c:join(100, 111)                -- join(room_id, 自己的token)；须与 set_player_token 一致
@@ -154,7 +165,7 @@ local cfid, cdata, cok = c:catch_up()           -- 追帧：丢旧广播，跳�
 | 方法 | 说明 |
 |------|------|
 | `fs.new(port, frame_rate)` | 创建连接（绑定端口，自动启动驱动线程；frame_rate 为驱动帧节拍，严格 tick 调度，默认 20） |
-| `conn:new_room(room_id, max_player, timeout_ms, token, ttl_ms, idle_timeout_ms[, players])` | 创建多玩家房间；`players` 为初始玩家 id 表（校验人数 ≤ max_player、预登记 INIT），服务器生成 per-player token 并返回 (room, tokens) |
+| `conn:new_room(room_id, timeout_ms, token, ttl_ms, idle_timeout_ms[, players])` | 创建多玩家房间；`players` 为初始玩家 id 表（校验人数 ≤ 房间容量、预登记 INIT），服务器生成 per-player token 并返回 (room, tokens) |
 | `room:add_player(conv, ip, port)` | 手动登记玩家（可选；默认由客户端 JOIN 自动登记；含转房排重/INIT/掉线槽位复用） |
 | `room:set_player_token(conv, token)` | 登记该玩家的专属会话 token（per-player 鉴权，JOIN 时按 conv 校验） |
 | `room:remove_player(conv)` | 主动移除玩家（任何占位皆可；释放其 KCP，重置本帧收集） |
@@ -183,12 +194,12 @@ local cfid, cdata, cok = c:catch_up()           -- 追帧：丢旧广播，跳�
 
 ## 测试
 
+# 编译生成lua5.4.8的可执行程序lua
+cd kfs_src/third/lua-5.4.8 && make
+
 ```bash
-cd lua_server
-# 终端1：服务器
-lua5.4 server.lua
-# 终端2：客户端
-lua5.4 client.lua
+# 终端1（服务器）：cd lua_test && ../kfs_src/third/lua-5.4.8/src/lua server.lua server.lua
+# 终端2（客户端）：cd lua_test && ../kfs_src/third/lua-5.4.8/src/lua server.lua client.lua
 ```
 
 配置文件 `config` 中的 `client_count` / `conv` 决定客户端数量与 conv；

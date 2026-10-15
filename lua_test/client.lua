@@ -2,8 +2,8 @@
 -- client.lua — KCP 帧同步库 客户端测试脚本
 --
 -- 功能：
---   1. 读取 lua_server/config 的服务器地址/房间参数
---   2. 每个客户端用 kcpframesynclib_client 创建会话，端口传 0（系统分配）
+--   1. 读取 lua_test/config 的服务器地址/房间参数
+--   2. 每个客户端用 kfsclientlib 创建会话，端口传 0（系统分配）
 --   3. c:setpeer(server_ip, server_port) 指定服务器
 --   4. c:join(room_id) 发裸 UDP JOIN，服务器从源地址自动学本客户端地址
 --      并登记进房间；收到 ACK 后 join() 返回 true
@@ -18,11 +18,11 @@
 -- 依赖：Lua 5.4，无第三方 socket 库
 --=====================================================================
 
-package.cpath = package.cpath .. ";../kcpframesynclib/build/?.so"
-local kfs = require("kcpframesynclib_client")
+package.cpath = package.cpath .. ";../kfs_src/build/?.so"
+local kfs = require("kfsclientlib")
 
 -----------------------------------------------------------------------
--- 读取 lua_server/config
+-- 读取 lua_test/config
 -----------------------------------------------------------------------
 local function load_config(path)
     local f = assert(io.open(path, "r"), "无法打开配置文件: " .. path)

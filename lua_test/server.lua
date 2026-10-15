@@ -2,8 +2,8 @@
 -- server.lua — KCP 帧同步库 服务器测试脚本（多玩家房间收集转发）
 --
 -- 功能：
---   1. 读取 lua_server/config 的服务器与房间参数
---   2. 用 kcpframesynclib 绑定 UDP 端口，创建多玩家房间 new_room
+--   1. 读取 lua_test/config 的服务器与房间参数
+--   2. 用 kfsserverlib 绑定 UDP 端口，创建多玩家房间 new_room
 --   3. 玩家由客户端发裸 UDP JOIN 自动登记（服务器从包源地址学地址），
 --      无需预先 add_player(conv, ip, port)
 --   4. 后台驱动线程自动：收客户端输入帧 → 集齐全员 → 广播给同房所有客户端
@@ -12,11 +12,11 @@
 -- 依赖：Lua 5.4，无第三方 socket 库（收发包/驱动由 C 库完成）
 --=====================================================================
 
-package.cpath = package.cpath .. ";../kcpframesynclib/build/?.so"
-local kcpframesynclib = require("kcpframesynclib")
+package.cpath = package.cpath .. ";../kfs_src/build/?.so"
+local kfsserverlib = require("kfsserverlib")
 
 -----------------------------------------------------------------------
--- 读取 lua_server/config 配置文件（轻量 key=value，# 开头为注释）
+-- 读取 lua_test/config 配置文件（轻量 key=value，# 开头为注释）
 -----------------------------------------------------------------------
 local function load_config(path)
     local f = assert(io.open(path, "r"), "无法打开配置文件: " .. path)
@@ -57,7 +57,7 @@ print(string.format("[server lua] 配置: udp=%s 房间=%d 最大玩家=%d 超�
 -----------------------------------------------------------------------
 -- 绑定 UDP 端口，创建多玩家房间
 -----------------------------------------------------------------------
-local conn, err = kcpframesynclib.new(udp_port, frame_rate)
+local conn, err = kfsserverlib.new(udp_port, frame_rate)
 if not conn then
     print("[server lua] 绑定端口失败: " .. tostring(err))
     os.exit(1)
