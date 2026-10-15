@@ -47,7 +47,7 @@ local room_token    = cfg.token         or 0   -- 会话鉴权 token（0=不校�
 local room_ttl      = cfg.ttl_ms        or 0   -- 房间最长保留 ms（0=永久）
 local idle_timeout  = cfg.idle_timeout_ms or 0 -- 玩家掉线判定 ms（0=不启用）
 
-
+-- 线上业务可以考虑全服唯一id
 local room_id       = cfg.room_id       or 100
 
 print(string.format("[server lua] 配置: udp=%s 房间=%d 最大玩家=%d 超时=%dms 帧率=%d 时长=%dms token=%d ttl=%dms idle=%dms",
@@ -80,36 +80,46 @@ local function parse_id_list(s)
     end
     return t, player_count
 end
-local players, player_count = parse_id_list(cfg.player_ids)
+
 
 -- new_room 失败会抛 Lua 错误，故用 pcall 捕获
--- 参数：room_id, timeout_ms, token, ttl_ms, idle_timeout_ms, players
+-- 参数：room_id, timeout_ms, token, ttl_ms, idle_timeout_ms, room_players
 -- 房间容量 = 初始玩家列表长度（C 库已校验初始人数 ≤ 8）
--- 传 players 时返回 (room, tokens)；tokens = {[conv]=服务器生成的专属token}
-local ok, room, tokens = pcall(function()
-    return conn:new_room(room_id, timeout_ms,
-                         room_token, room_ttl, idle_timeout, players)
-end)
-if not ok then
-    print("[server lua] 创建房间失败: " .. tostring(room))
-    conn:close()
-    os.exit(1)
-end
-print(string.format("[server lua] 创建房间 room_id=%d，等待客户端 join() 自动登记",
-      tostring(udp_port), room_id))
-
------------------------------------------------------------------------
--- 服务器生成的 per-player token：打印并写入 tokens.txt（模拟分发通道）。
---   真实部署中应经安全通道发给对应玩家（登录服/房间服下发）。
------------------------------------------------------------------------
-if tokens and next(tokens) then
-    local f = assert(io.open("tokens.txt", "w"))
-    for conv, tk in pairs(tokens) do
-        f:write(string.format("%d %d\n", conv, tk))
-        print(string.format("[server lua] 玩家 conv=%d 专属token=%d", conv, tk))
+-- 传 room_players 时返回 (room, tokens)；tokens = {[conv]=服务器生成的专属token}
+local rooms = {}
+local room_count = 10
+for i = 1, room_count do
+    local room_id = i
+    local room_players = {
+        [room_id*100 + 1] = true,
+        [room_id*100 + 2] = true,
+    }
+    local ok, room, tokens = pcall(function()
+        return conn:new_room(room_id, timeout_ms,
+                            room_token, room_ttl, idle_timeout, room_players)
+    end)
+    if not ok then
+        print("[server lua] 创建房间失败: " .. tostring(room))
+        conn:close()
+        os.exit(1)
     end
-    f:close()
-    print("[server lua] per-player token 已生成并登记，写入 tokens.txt 供客户端模拟领取")
+    rooms[room_id] = room
+    print(string.format("[server lua] 创建房间 room_id=%d，等待客户端 join() 自动登记", room_id))
+
+    -----------------------------------------------------------------------
+    -- 服务器生成的 per-player token：打印并写入 tokens_xxx.txt（模拟分发通道）。
+    --   真实部署中应经安全通道发给对应玩家（登录服/房间服下发）。
+    -----------------------------------------------------------------------
+    if tokens and next(tokens) then
+        local tokens_file_name = string.format("tokens_%d.txt",room_id)
+        local f = assert(io.open(tokens_file_name, "w"))
+        for conv, tk in pairs(tokens) do
+            f:write(string.format("%d %d\n", conv, tk))
+            print(string.format("[server lua] 房间 room_id=%d 玩家 conv=%d 专属token=%d", room_id, conv, tk))
+        end
+        f:close()
+        print(string.format("[server lua] 房间 room_id=%d，写入 %s 供客户端模拟领取", room_id, tokens_file_name))
+    end
 end
 
 -----------------------------------------------------------------------
@@ -130,27 +140,30 @@ while true do
     -- 业务层判活：全员连接并上报就绪后，通知房间开始同步推帧。
     -- 准备阶段（phase=0）没有帧包，玩家连接全靠心跳（heartbeat_ms）保活，
     -- 心跳超时（idle_timeout_ms）标记掉线——这就是准备阶段必须保留心跳的原因。
-    if room:get_phase() == 0 then
-        local ready = room:ready_count()
-        if ready >= expect_players then
-            room:start()
-            print(string.format("[server lua] 全员就绪(%d/%d)，房间开始同步推帧",
-                  ready, expect_players))
-        end
-    end
-
-    -- 每秒打印一次房间状态
-    if now_ms - last_print >= 1000 then
-        last_print = now_ms
-        print(string.format("[server lua][%d] 运行 %.1fs  phase=%d 房间=%d 玩家=%d 就绪=%d",
-            os.time(), (now_ms - start_time) / 1000, room:get_phase(),
-            room:get_id(), room:get_count(), room:ready_count()))
-            
+    for i, room in pairs(rooms) do
         if room:get_phase() == 0 then
-            -- 超时
-            room:start()
-            print(string.format("[server lua] 超时开始同步推帧 就绪(%d/%d)",
-                  ready, expect_players))
+            local ready = room:ready_count()
+            if ready >= expect_players then
+                room:start()
+                print(string.format("[server lua] 全员就绪(%d/%d)，房间开始同步推帧",
+                      ready, expect_players))
+            end
+        end
+    
+        -- 每秒打印一次房间状态
+        if now_ms - last_print >= 500 then
+            last_print = now_ms
+            print(string.format("[server lua][%d] 运行 %.1fs  phase=%d 房间=%d 玩家=%d 就绪=%d",
+                os.time(), (now_ms - start_time) / 1000, room:get_phase(),
+                room:get_id(), room:get_count(), room:ready_count()))
+                
+            if room:get_phase() == 0 then
+                -- 超时
+                room:start()
+                local ready = room:ready_count()
+                print(string.format("[server lua] 超时开始同步推帧 就绪(%d/%d)",
+                      ready, expect_players))
+            end
         end
     end
 
@@ -160,6 +173,8 @@ end
 -----------------------------------------------------------------------
 -- 关闭房间与连接
 -----------------------------------------------------------------------
-room:close()
+for k, room in pairs(rooms) do
+    room:close()
+end
 conn:close()
 print("[server lua] 房间与连接已关闭")

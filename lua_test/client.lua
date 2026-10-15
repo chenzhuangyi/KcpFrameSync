@@ -45,20 +45,29 @@ local cfg = load_config("config")
 
 local server_ip   = cfg.server_ip     or "127.0.0.1"
 local server_port = cfg.server_port   or 10500
-local room_id     = cfg.room_id       or 100
-local conv_start  = cfg.conv          or 1000
 local client_count= cfg.client_count  or 4
 local frame_rate  = cfg.frame_rate    or 20
 local duration_ms = cfg.clinten_duration_ms   or 5000
 local advance_frames = cfg.advance_frames or 2   -- 输入提前量窗口（帧）
 local heartbeat_ms   = cfg.heartbeat_ms  or 0   -- 自动心跳间隔 ms（0=关闭）
 
+local arg = {...}
+local room_id = arg[1]
+if not room_id then
+    print(string.format("[client][lua] 参数为nil"))
+    return
+end
+room_id = tonumber(room_id)
+if room_id <= 0 then
+    print(string.format("[client][lua] 参数 room_id=%d", room_id))
+end
 
 -- 服务器生成的 per-player token（server.lua 写入 tokens.txt，模拟分发通道）：
 -- 客户端按自己的 conv 领取 token，凭它 join 房间。
 local function load_server_tokens()
     local t = {}
-    local f = io.open("tokens.txt", "r")
+    local tokens_file_name = string.format("tokens_%d.txt",room_id)
+    local f = io.open(tokens_file_name, "r")
     if not f then return t end
     for line in f:lines() do
         local conv, tk = line:match("^(%d+)%s+(%d+)")
@@ -115,9 +124,9 @@ local function make_client(conv)
     return c, conv
 end
 
-print(string.format("[client] 服务器 %s:%d 房间 %d 客户端数=%d conv起始=%d 帧率=%d 时长=%dms",
+print(string.format("[client] 服务器 %s:%d 房间 %d 客户端数=%d 帧率=%d 时长=%dms",
       server_ip, tostring(server_port), room_id, client_count,
-      conv_start, frame_rate, duration_ms))
+      frame_rate, duration_ms))
 
 -----------------------------------------------------------------------
 -- 每个客户端一个进程场景：此处模拟“依次建立并各自上报”的调度

@@ -29,15 +29,6 @@ advance_frames = 2
 # 测试运行时长（毫秒）
 duration_ms = 5000
 clinten_duration_ms = 2000
-# 房间标识
-room_id = 100
-# 初始玩家 id 列表：逗号分隔（如 "1,2"），即"需要通知加入房间的玩家"。
-# 创建房间时校验初始人数 ≤ max_player；把初始玩家预登记为 INIT 占位（等客户端
-# JOIN 连接），并为每个玩家生成专属 token 返回 tokens 给 server.lua 分发。
-# 初始玩家掉线不移除（席位保留，同 conv 重连恢复）。
-player_ids = "1,2"
-# 客户端备用 token（可选）：手动指定时优先于服务器下发的 tokens.txt（调试用）
-client_token = ""
 
 
 # ---- 客户端批量测试参数（client.lua 使用） ----
