@@ -221,3 +221,6 @@ cd kfs_src/third/lua-5.4.8 && make
 
 `heartbeat_ms`（客户端）与 `idle_timeout_ms`（服务器）必须配合：
 准备阶段心跳 500ms、掉线阈值 2000ms（连丢 4 个心跳判掉线）。
+
+<img width="1920" height="1032" alt="image" src="https://github.com/user-attachments/assets/f01d6bf0-25c6-4e80-a407-d5febae4563a" />
+
