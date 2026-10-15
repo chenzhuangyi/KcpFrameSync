@@ -81,19 +81,38 @@ local function parse_id_list(s)
     return t, player_count
 end
 
+local arg = {...}
+local room_count = arg[1]
+if not room_count then
+    print(string.format("[client][lua] 参数1为nil"))
+    return
+end
+room_count = tonumber(room_count)
+if room_count <= 0 or room_count > 100 then
+    print(string.format("[client][lua] 参数 room_count=%d", room_count))
+end
+
+local room_player_count = arg[2]
+if not room_player_count then
+    print(string.format("[client][lua] 参数2为nil"))
+    return
+end
+room_player_count = tonumber(room_player_count)
+if room_player_count <= 0 then
+    print(string.format("[client][lua] 参数 room_player_count=%d", room_player_count))
+end
 
 -- new_room 失败会抛 Lua 错误，故用 pcall 捕获
 -- 参数：room_id, timeout_ms, token, ttl_ms, idle_timeout_ms, room_players
 -- 房间容量 = 初始玩家列表长度（C 库已校验初始人数 ≤ 8）
 -- 传 room_players 时返回 (room, tokens)；tokens = {[conv]=服务器生成的专属token}
 local rooms = {}
-local room_count = 10
 for i = 1, room_count do
     local room_id = i
-    local room_players = {
-        [room_id*100 + 1] = true,
-        [room_id*100 + 2] = true,
-    }
+    local room_players = {}
+    for ii = 1, room_player_count do
+        room_players[room_id*100 + ii] = true
+    end
     local ok, room, tokens = pcall(function()
         return conn:new_room(room_id, timeout_ms,
                             room_token, room_ttl, idle_timeout, room_players)
@@ -128,7 +147,6 @@ end
 -----------------------------------------------------------------------
 local start_time = os.clock() * 1000
 local last_print = start_time
-local expect_players = tonumber(cfg.client_count) or 2   -- 业务层判定"全员"的目标人数
 
 while true do
     local now_ms = math.floor(os.clock() * 1000)
@@ -143,6 +161,7 @@ while true do
     for i, room in pairs(rooms) do
         if room:get_phase() == 0 then
             local ready = room:ready_count()
+            local expect_players = room:init_count()
             if ready >= expect_players then
                 room:start()
                 print(string.format("[server lua] 全员就绪(%d/%d)，房间开始同步推帧",
@@ -161,6 +180,7 @@ while true do
                 -- 超时
                 room:start()
                 local ready = room:ready_count()
+                local expect_players = room:init_count()
                 print(string.format("[server lua] 超时开始同步推帧 就绪(%d/%d)",
                       ready, expect_players))
             end

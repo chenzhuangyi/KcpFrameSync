@@ -36,8 +36,6 @@ clinten_duration_ms = 2000
 server_ip = "127.0.0.1"
 # 目标服务器端口（默认取 udp_port）
 # server_port = "10500"
-# 并发客户端数量
-client_count = 2
 # 客户端自动心跳间隔（毫秒）：走 KCP 可靠传输补发 HEARTBEAT，供服务器
 # 基于 last_active 做掉线判定（须与服务器 idle_timeout_ms 配合）；0=关闭。
 # 准备阶段（房间未 start、尚无帧包）玩家连接全靠心跳保活，必须开启。

@@ -45,12 +45,12 @@ local cfg = load_config("config")
 
 local server_ip   = cfg.server_ip     or "127.0.0.1"
 local server_port = cfg.server_port   or 10500
-local client_count= cfg.client_count  or 4
 local frame_rate  = cfg.frame_rate    or 20
 local duration_ms = cfg.clinten_duration_ms   or 5000
 local advance_frames = cfg.advance_frames or 2   -- 输入提前量窗口（帧）
 local heartbeat_ms   = cfg.heartbeat_ms  or 0   -- 自动心跳间隔 ms（0=关闭）
 
+local client_count = 0
 local arg = {...}
 local room_id = arg[1]
 if not room_id then
@@ -71,7 +71,10 @@ local function load_server_tokens()
     if not f then return t end
     for line in f:lines() do
         local conv, tk = line:match("^(%d+)%s+(%d+)")
-        if conv then t[tonumber(conv)] = tonumber(tk) end
+        if conv then 
+            t[tonumber(conv)] = tonumber(tk) 
+            client_count = client_count + 1
+        end
     end
     f:close()
     return t
@@ -138,9 +141,6 @@ local startup = os.clock() * 1000
 
 local join_player = 0
 for conv, token in pairs(server_tokens) do
-    if join_player >= client_count then
-        break
-    end
     local c, err = make_client(conv)
     if not c then
         print(string.format("[client] conv=%d 加入失败: %s", conv, tostring(err)))

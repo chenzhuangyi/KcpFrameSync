@@ -59,6 +59,7 @@ static int kfs_srv_set_player_token(lua_State *L);
 static int kfs_srv_get_id(lua_State *L);
 static int kfs_srv_get_count(lua_State *L);
 static int kfs_srv_start(lua_State *L);
+static int kfs_srv_init_count(lua_State *L);
 static int kfs_srv_ready_count(lua_State *L);
 static int kfs_srv_get_phase(lua_State *L);
 static int kfs_srv_close(lua_State *L);
@@ -798,6 +799,7 @@ static int kfs_conn_new_room(lua_State *L)
             { "get_id",        kfs_srv_get_id        },
             { "get_count",     kfs_srv_get_count     },
             { "start",         kfs_srv_start         },
+            { "init_count",    kfs_srv_init_count    },
             { "ready_count",   kfs_srv_ready_count   },
             { "get_phase",     kfs_srv_get_phase     },
             { "close",         kfs_srv_close         },
@@ -943,6 +945,26 @@ static int kfs_srv_start(lua_State *L)
     }
     pthread_mutex_unlock(&r->lock);
     lua_pushinteger(L, rc);
+    return 1;
+}
+
+// srvroom:ready_count() — 已上报就绪的玩家数（业务层据此判定全员就绪）
+static int kfs_srv_init_count(lua_State *L)
+{
+    kfs_srvroom_t *srv = check_srvroom(L, 1);
+    kfs_netref *r = srv->r;
+    int n = 0, j;
+
+    if (r && !srv->closed) {
+        pthread_mutex_lock(&r->lock);
+        {
+            kfs_room *room = kfs_room_find(r, srv->room_id);
+            if (room)
+                n = room->init_count;
+        }
+        pthread_mutex_unlock(&r->lock);
+    }
+    lua_pushinteger(L, n);
     return 1;
 }
 
