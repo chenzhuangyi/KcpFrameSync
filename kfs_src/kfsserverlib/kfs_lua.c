@@ -10,17 +10,17 @@
 //=====================================================================
 static kfs_conn_t *check_conn(lua_State *L, int idx)
 {
-    return (kfs_conn_t *)luaL_checkudata(L, idx, "kcpframesynclib");
+    return (kfs_conn_t *)luaL_checkudata(L, idx, "kfsserverlib");
 }
 
 static kfs_room_t *check_room(lua_State *L, int idx)
 {
-    return (kfs_room_t *)luaL_checkudata(L, idx, "kcpframesynclib.room");
+    return (kfs_room_t *)luaL_checkudata(L, idx, "kfsserverlib.room");
 }
 
 static kfs_srvroom_t *check_srvroom(lua_State *L, int idx)
 {
-    return (kfs_srvroom_t *)luaL_checkudata(L, idx, "kcpframesynclib.srvroom");
+    return (kfs_srvroom_t *)luaL_checkudata(L, idx, "kfsserverlib.srvroom");
 }
 
 //=====================================================================
@@ -93,7 +93,7 @@ static int kfs_new(lua_State *L)
         return 2;
     }
 
-    if (luaL_newmetatable(L, "kcpframesynclib")) {
+    if (luaL_newmetatable(L, "kfsserverlib")) {
         static const luaL_Reg methods[] = {
             { "create_room", kfs_conn_create_room },
             { "new_room",    kfs_conn_new_room    },
@@ -109,7 +109,7 @@ static int kfs_new(lua_State *L)
         lua_pushvalue(L, -2);
         lua_rawset(L, -3);
         lua_pushliteral(L, "__metatable");
-        lua_pushliteral(L, "kcpframesynclib");
+        lua_pushliteral(L, "kfsserverlib");
         lua_rawset(L, -3);
     }
     lua_setmetatable(L, -2);
@@ -130,7 +130,7 @@ static int kfs_conn_create_room(lua_State *L)
     kfs_room_t *room;
 
     if (r == NULL)
-        return luaL_error(L, "kcpframesynclib: connection gone");
+        return luaL_error(L, "error kfs_lua: connection gone");
 
     // 先创建 Lua 对象与 KCP（锁外，避免持锁触发 GC）
     room = (kfs_room_t *)lua_newuserdatauv(L, sizeof(kfs_room_t), 0);
@@ -142,7 +142,7 @@ static int kfs_conn_create_room(lua_State *L)
     if (room->kcp == NULL) {
         netref_release(room->r);
         room->r = NULL;
-        return luaL_error(L, "kcpframesynclib: ikcp_create failed");
+        return luaL_error(L, "error kfs_lua: ikcp_create failed");
     }
 
     // 持锁注册路由 + 设置输出回调/默认参数
@@ -153,7 +153,7 @@ static int kfs_conn_create_room(lua_State *L)
         room->kcp = NULL;
         netref_release(room->r);
         room->r = NULL;
-        return luaL_error(L, "kcpframesynclib: connection closed");
+        return luaL_error(L, "error kfs_lua: connection closed");
     }
     if (netref_route_add(r, (IUINT32)conv, room->kcp) != 0) {
         pthread_mutex_unlock(&r->lock);
@@ -161,7 +161,7 @@ static int kfs_conn_create_room(lua_State *L)
         room->kcp = NULL;
         netref_release(room->r);
         room->r = NULL;
-        return luaL_error(L, "kcpframesynclib: conv %d already in use",
+        return luaL_error(L, "error kfs_lua: conv %d already in use",
                           (int)conv);
     }
     ikcp_setoutput(room->kcp, kfs_output);
@@ -169,7 +169,7 @@ static int kfs_conn_create_room(lua_State *L)
     pthread_mutex_unlock(&r->lock);
 
     // metatable（锁外）
-    if (luaL_newmetatable(L, "kcpframesynclib.room")) {
+    if (luaL_newmetatable(L, "kfsserverlib.room")) {
         static const luaL_Reg methods[] = {
             { "update",      kfs_room_update      },
             { "check",       kfs_room_check       },
@@ -195,7 +195,7 @@ static int kfs_conn_create_room(lua_State *L)
         lua_pushvalue(L, -2);
         lua_rawset(L, -3);
         lua_pushliteral(L, "__metatable");
-        lua_pushliteral(L, "kcpframesynclib.room");
+        lua_pushliteral(L, "kfsserverlib.room");
         lua_rawset(L, -3);
     }
     lua_setmetatable(L, -2);
@@ -215,11 +215,11 @@ static int kfs_conn_dispatch(lua_State *L)
     int rcv, i;
 
     if (r == NULL)
-        return luaL_error(L, "kcpframesynclib: connection gone");
+        return luaL_error(L, "error kfs_lua: connection gone");
     pthread_mutex_lock(&r->lock);
     if (r->closed) {
         pthread_mutex_unlock(&r->lock);
-        return luaL_error(L, "kcpframesynclib: connection closed");
+        return luaL_error(L, "error kfs_lua: connection closed");
     }
     while ((rcv = net_recv(r->net, buf, KFS_NET_MAX_PKT, &from)) > 0) {
         ikcpcb *kcp;
@@ -250,14 +250,14 @@ static int kfs_conn_setpeer(lua_State *L)
     peer.sin_family = AF_INET;
     peer.sin_port = htons((uint16_t)port);
     if (inet_pton(AF_INET, ip, &peer.sin_addr) != 1)
-        return luaL_error(L, "kcpframesynclib: invalid ip '%s'", ip);
+        return luaL_error(L, "error kfs_lua: invalid ip '%s'", ip);
 
     if (r == NULL)
-        return luaL_error(L, "kcpframesynclib: connection gone");
+        return luaL_error(L, "error kfs_lua: connection gone");
     pthread_mutex_lock(&r->lock);
     if (r->closed || r->net == NULL) {
         pthread_mutex_unlock(&r->lock);
-        return luaL_error(L, "kcpframesynclib: connection closed");
+        return luaL_error(L, "error kfs_lua: connection closed");
     }
     lua_pushinteger(L, net_set_peer(r->net, &peer));
     pthread_mutex_unlock(&r->lock);
@@ -314,11 +314,11 @@ static int kfs_room_update(lua_State *L)
     lua_Integer now = luaL_checkinteger(L, 2);
     kfs_netref *r = room->r;
     if (r == NULL)
-        return luaL_error(L, "kcpframesynclib: room gone");
+        return luaL_error(L, "error kfs_lua: room gone");
     pthread_mutex_lock(&r->lock);
     if (room->kcp == NULL) {
         pthread_mutex_unlock(&r->lock);
-        return luaL_error(L, "kcpframesynclib: room closed");
+        return luaL_error(L, "error kfs_lua: room closed");
     }
     ikcp_update(room->kcp, (IUINT32)now);
     pthread_mutex_unlock(&r->lock);
@@ -333,11 +333,11 @@ static int kfs_room_check(lua_State *L)
     kfs_netref *r = room->r;
     lua_Integer next;
     if (r == NULL)
-        return luaL_error(L, "kcpframesynclib: room gone");
+        return luaL_error(L, "error kfs_lua: room gone");
     pthread_mutex_lock(&r->lock);
     if (room->kcp == NULL) {
         pthread_mutex_unlock(&r->lock);
-        return luaL_error(L, "kcpframesynclib: room closed");
+        return luaL_error(L, "error kfs_lua: room closed");
     }
     next = (lua_Integer)ikcp_check(room->kcp, (IUINT32)now);
     pthread_mutex_unlock(&r->lock);
@@ -351,11 +351,11 @@ static int kfs_room_flush(lua_State *L)
     kfs_room_t *room = check_room(L, 1);
     kfs_netref *r = room->r;
     if (r == NULL)
-        return luaL_error(L, "kcpframesynclib: room gone");
+        return luaL_error(L, "error kfs_lua: room gone");
     pthread_mutex_lock(&r->lock);
     if (room->kcp == NULL) {
         pthread_mutex_unlock(&r->lock);
-        return luaL_error(L, "kcpframesynclib: room closed");
+        return luaL_error(L, "error kfs_lua: room closed");
     }
     ikcp_flush(room->kcp);
     pthread_mutex_unlock(&r->lock);
@@ -371,11 +371,11 @@ static int kfs_room_input(lua_State *L)
     kfs_netref *r = room->r;
     int ret;
     if (r == NULL)
-        return luaL_error(L, "kcpframesynclib: room gone");
+        return luaL_error(L, "error kfs_lua: room gone");
     pthread_mutex_lock(&r->lock);
     if (room->kcp == NULL) {
         pthread_mutex_unlock(&r->lock);
-        return luaL_error(L, "kcpframesynclib: room closed");
+        return luaL_error(L, "error kfs_lua: room closed");
     }
     ret = (int)ikcp_input(room->kcp, data, (long)len);
     pthread_mutex_unlock(&r->lock);
@@ -390,11 +390,11 @@ static int kfs_room_peeksize(lua_State *L)
     kfs_netref *r = room->r;
     int size;
     if (r == NULL)
-        return luaL_error(L, "kcpframesynclib: room gone");
+        return luaL_error(L, "error kfs_lua: room gone");
     pthread_mutex_lock(&r->lock);
     if (room->kcp == NULL) {
         pthread_mutex_unlock(&r->lock);
-        return luaL_error(L, "kcpframesynclib: room closed");
+        return luaL_error(L, "error kfs_lua: room closed");
     }
     size = ikcp_peeksize(room->kcp);
     pthread_mutex_unlock(&r->lock);
@@ -409,11 +409,11 @@ static int kfs_room_waitsnd(lua_State *L)
     kfs_netref *r = room->r;
     int n;
     if (r == NULL)
-        return luaL_error(L, "kcpframesynclib: room gone");
+        return luaL_error(L, "error kfs_lua: room gone");
     pthread_mutex_lock(&r->lock);
     if (room->kcp == NULL) {
         pthread_mutex_unlock(&r->lock);
-        return luaL_error(L, "kcpframesynclib: room closed");
+        return luaL_error(L, "error kfs_lua: room closed");
     }
     n = ikcp_waitsnd(room->kcp);
     pthread_mutex_unlock(&r->lock);
@@ -430,13 +430,13 @@ static int kfs_room_send(lua_State *L)
     kfs_netref *r = room->r;
     int ret;
     if (len > (size_t)0x7FFF)
-        return luaL_error(L, "kcpframesynclib: send data too large (%zu)", len);
+        return luaL_error(L, "error kfs_lua: send data too large (%zu)", len);
     if (r == NULL)
-        return luaL_error(L, "kcpframesynclib: room gone");
+        return luaL_error(L, "error kfs_lua: room gone");
     pthread_mutex_lock(&r->lock);
     if (room->kcp == NULL) {
         pthread_mutex_unlock(&r->lock);
-        return luaL_error(L, "kcpframesynclib: room closed");
+        return luaL_error(L, "error kfs_lua: room closed");
     }
     ret = ikcp_send(room->kcp, data, (int)len);
     pthread_mutex_unlock(&r->lock);
@@ -452,11 +452,11 @@ static int kfs_room_recv(lua_State *L)
     int size, ret;
     char *buf;
     if (r == NULL)
-        return luaL_error(L, "kcpframesynclib: room gone");
+        return luaL_error(L, "error kfs_lua: room gone");
     pthread_mutex_lock(&r->lock);
     if (room->kcp == NULL) {
         pthread_mutex_unlock(&r->lock);
-        return luaL_error(L, "kcpframesynclib: room closed");
+        return luaL_error(L, "error kfs_lua: room closed");
     }
     size = ikcp_peeksize(room->kcp);
     if (size < 0) {
@@ -466,7 +466,7 @@ static int kfs_room_recv(lua_State *L)
     buf = (char *)malloc((size_t)size);
     if (buf == NULL) {
         pthread_mutex_unlock(&r->lock);
-        return luaL_error(L, "kcpframesynclib: out of memory");
+        return luaL_error(L, "error kfs_lua: out of memory");
     }
     ret = ikcp_recv(room->kcp, buf, size);
     pthread_mutex_unlock(&r->lock);
@@ -487,11 +487,11 @@ static int kfs_room_nodelay(lua_State *L)
     kfs_netref *r = room->r;
     int ret;
     if (r == NULL)
-        return luaL_error(L, "kcpframesynclib: room gone");
+        return luaL_error(L, "error kfs_lua: room gone");
     pthread_mutex_lock(&r->lock);
     if (room->kcp == NULL) {
         pthread_mutex_unlock(&r->lock);
-        return luaL_error(L, "kcpframesynclib: room closed");
+        return luaL_error(L, "error kfs_lua: room closed");
     }
     ret = ikcp_nodelay(room->kcp, nodelay, interval, resend, nc);
     pthread_mutex_unlock(&r->lock);
@@ -508,11 +508,11 @@ static int kfs_room_wndsize(lua_State *L)
     kfs_netref *r = room->r;
     int ret;
     if (r == NULL)
-        return luaL_error(L, "kcpframesynclib: room gone");
+        return luaL_error(L, "error kfs_lua: room gone");
     pthread_mutex_lock(&r->lock);
     if (room->kcp == NULL) {
         pthread_mutex_unlock(&r->lock);
-        return luaL_error(L, "kcpframesynclib: room closed");
+        return luaL_error(L, "error kfs_lua: room closed");
     }
     ret = ikcp_wndsize(room->kcp, sndwnd, rcvwnd);
     pthread_mutex_unlock(&r->lock);
@@ -528,11 +528,11 @@ static int kfs_room_setmtu(lua_State *L)
     kfs_netref *r = room->r;
     int ret;
     if (r == NULL)
-        return luaL_error(L, "kcpframesynclib: room gone");
+        return luaL_error(L, "error kfs_lua: room gone");
     pthread_mutex_lock(&r->lock);
     if (room->kcp == NULL) {
         pthread_mutex_unlock(&r->lock);
-        return luaL_error(L, "kcpframesynclib: room closed");
+        return luaL_error(L, "error kfs_lua: room closed");
     }
     ret = ikcp_setmtu(room->kcp, mtu);
     pthread_mutex_unlock(&r->lock);
@@ -547,11 +547,11 @@ static int kfs_room_getconv(lua_State *L)
     kfs_netref *r = room->r;
     lua_Integer conv;
     if (r == NULL)
-        return luaL_error(L, "kcpframesynclib: room gone");
+        return luaL_error(L, "error kfs_lua: room gone");
     pthread_mutex_lock(&r->lock);
     if (room->kcp == NULL) {
         pthread_mutex_unlock(&r->lock);
-        return luaL_error(L, "kcpframesynclib: room closed");
+        return luaL_error(L, "error kfs_lua: room closed");
     }
     conv = (lua_Integer)ikcp_getconv((const void *)room->kcp);
     pthread_mutex_unlock(&r->lock);
@@ -575,20 +575,20 @@ static int kfs_room_send_frame(lua_State *L)
     kfs_netref *r = room->r;
 
     if (len > (size_t)KFS_FRAME_MAX_DATA)
-        return luaL_error(L, "kcpframesynclib: frame too large (%zu)", len);
+        return luaL_error(L, "error kfs_lua: frame too large (%zu)", len);
     if (len > (size_t)0x7FFF - KFS_FRAME_HEADER_SIZE)
-        return luaL_error(L, "kcpframesynclib: frame exceeds kcp message limit");
+        return luaL_error(L, "error kfs_lua: frame exceeds kcp message limit");
     total = frame_encode(pkt, (int)sizeof(pkt),
                          (uint32_t)(fid & 0xFFFFFFFFu), data, (int)len);
     if (total < 0)
-        return luaL_error(L, "kcpframesynclib: frame encode failed");
+        return luaL_error(L, "error kfs_lua: frame encode failed");
 
     if (r == NULL)
-        return luaL_error(L, "kcpframesynclib: room gone");
+        return luaL_error(L, "error kfs_lua: room gone");
     pthread_mutex_lock(&r->lock);
     if (room->kcp == NULL) {
         pthread_mutex_unlock(&r->lock);
-        return luaL_error(L, "kcpframesynclib: room closed");
+        return luaL_error(L, "error kfs_lua: room closed");
     }
     ret = ikcp_send(room->kcp, pkt, total);
     pthread_mutex_unlock(&r->lock);
@@ -608,11 +608,11 @@ static int kfs_room_recv_frame(lua_State *L)
     int dlen;
 
     if (r == NULL)
-        return luaL_error(L, "kcpframesynclib: room gone");
+        return luaL_error(L, "error kfs_lua: room gone");
     pthread_mutex_lock(&r->lock);
     if (room->kcp == NULL) {
         pthread_mutex_unlock(&r->lock);
-        return luaL_error(L, "kcpframesynclib: room closed");
+        return luaL_error(L, "error kfs_lua: room closed");
     }
 
     size = ikcp_peeksize(room->kcp);
@@ -622,12 +622,12 @@ static int kfs_room_recv_frame(lua_State *L)
     }
     if (size > KFS_FRAME_MAX_TOTAL) {
         pthread_mutex_unlock(&r->lock);
-        return luaL_error(L, "kcpframesynclib: bad frame size %d", size);
+        return luaL_error(L, "error kfs_lua: bad frame size %d", size);
     }
     pkt = (char *)malloc((size_t)size);
     if (pkt == NULL) {
         pthread_mutex_unlock(&r->lock);
-        return luaL_error(L, "kcpframesynclib: out of memory");
+        return luaL_error(L, "error kfs_lua: out of memory");
     }
     ret = ikcp_recv(room->kcp, pkt, size);
     pthread_mutex_unlock(&r->lock);
@@ -635,7 +635,7 @@ static int kfs_room_recv_frame(lua_State *L)
     if (ret < KFS_FRAME_HEADER_SIZE) { free(pkt); return 0; }
     if (frame_decode(pkt, ret, &fid, &data, &dlen) != 0) {
         free(pkt);
-        return luaL_error(L, "kcpframesynclib: bad frame payload");
+        return luaL_error(L, "error kfs_lua: bad frame payload");
     }
     lua_pushinteger(L, (lua_Integer)fid);
     lua_pushlstring(L, data, (size_t)dlen);
@@ -730,7 +730,7 @@ static int kfs_conn_new_room(lua_State *L)
     int rc, i;
 
     if (r == NULL)
-        return luaL_error(L, "kcpframesynclib: connection gone");
+        return luaL_error(L, "error kfs_lua: connection gone");
 
     // 收集初始玩家列表（锁外遍历玩家表：key=玩家 id(conv)）
     if (has_players) {
@@ -738,7 +738,7 @@ static int kfs_conn_new_room(lua_State *L)
         while (lua_next(L, 7) != 0) {
             // 设定的最大玩家数：1..KFS_ROOM_MAX_PLAYER-1（数组上限之外拒绝）
             if (init_count >= KFS_ROOM_MAX_PLAYER)
-                return luaL_error(L, "kcpframesynclib: init_count error! init_count>%d", (int)KFS_ROOM_MAX_PLAYER);
+                return luaL_error(L, "error kfs_lua: init_count error! init_count>%d", (int)KFS_ROOM_MAX_PLAYER);
         
             
             if (lua_type(L, -2) == LUA_TNUMBER &&
@@ -767,7 +767,7 @@ static int kfs_conn_new_room(lua_State *L)
     if (rc != 0) {
         netref_release(srv->r);
         srv->r = NULL;
-        return luaL_error(L, "kcpframesynclib: new_room failed (rc=%d)", rc);
+        return luaL_error(L, "error kfs_lua: new_room failed (rc=%d)", rc);
     }
 
     // 诊断：打印初始玩家登记（临时调试，确认后删除）
@@ -791,7 +791,7 @@ static int kfs_conn_new_room(lua_State *L)
         lua_rawset(L, -3);                              // tokens[conv]=t → [srv, tokens]
     }
 
-    if (luaL_newmetatable(L, "kcpframesynclib.srvroom")) {
+    if (luaL_newmetatable(L, "kfsserverlib.srvroom")) {
         static const luaL_Reg methods[] = {
             { "add_player",    kfs_srv_add_player    },
             { "remove_player", kfs_srv_remove_player },
@@ -811,7 +811,7 @@ static int kfs_conn_new_room(lua_State *L)
         lua_pushvalue(L, -2);
         lua_rawset(L, -3);
         lua_pushliteral(L, "__metatable");
-        lua_pushliteral(L, "kcpframesynclib.srvroom");
+        lua_pushliteral(L, "kfsserverlib.srvroom");
         lua_rawset(L, -3);
     }
     lua_setmetatable(L, -3);    // 栈: [srv(1), tokens(2), mt(3)] → srv 在 -3；setmetatable(srv) → [srv, tokens]
@@ -836,9 +836,9 @@ static int kfs_srv_add_player(lua_State *L)
     peer.sin_family = AF_INET;
     peer.sin_port = htons((uint16_t)port);
     if (inet_pton(AF_INET, ip, &peer.sin_addr) != 1)
-        return luaL_error(L, "kcpframesynclib: invalid ip '%s'", ip);
+        return luaL_error(L, "error kfs_lua: invalid ip '%s'", ip);
     if (r == NULL || srv->closed)
-        return luaL_error(L, "kcpframesynclib: room gone");
+        return luaL_error(L, "error kfs_lua: room gone");
     pthread_mutex_lock(&r->lock);
     room = kfs_room_find(r, srv->room_id);
     rc = room ? kfs_srv_add_player_c(r, room, (uint32_t)(conv & 0xFFFFFFFFu),
@@ -858,7 +858,7 @@ static int kfs_srv_remove_player(lua_State *L)
     int rc;
 
     if (r == NULL || srv->closed)
-        return luaL_error(L, "kcpframesynclib: room gone");
+        return luaL_error(L, "error kfs_lua: room gone");
     pthread_mutex_lock(&r->lock);
     room = kfs_room_find(r, srv->room_id);
     rc = room ? kfs_srv_remove_player_c(r, room,
@@ -881,7 +881,7 @@ static int kfs_srv_set_player_token(lua_State *L)
     int rc;
 
     if (r == NULL || srv->closed)
-        return luaL_error(L, "kcpframesynclib: room gone");
+        return luaL_error(L, "error kfs_lua: room gone");
     pthread_mutex_lock(&r->lock);
     room = kfs_room_find(r, srv->room_id);
     rc = room ? kfs_srv_set_player_token_c(room,
@@ -931,7 +931,7 @@ static int kfs_srv_start(lua_State *L)
     int rc = -1;
 
     if (r == NULL || srv->closed)
-        return luaL_error(L, "kcpframesynclib: room gone");
+        return luaL_error(L, "error kfs_lua: room gone");
     pthread_mutex_lock(&r->lock);
     room = kfs_room_find(r, srv->room_id);
     if (room) {

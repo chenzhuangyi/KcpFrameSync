@@ -7,7 +7,7 @@
 
 static kfs_client *check_client(lua_State *L, int idx)
 {
-    return (kfs_client *)luaL_checkudata(L, idx, "kcpframesynclib_client");
+    return (kfs_client *)luaL_checkudata(L, idx, "kfsclientlib");
 }
 
 //---------------------------------------------------------------------
@@ -52,7 +52,7 @@ static int kfs_new(lua_State *L)
         c->net = NULL;
         pthread_mutex_destroy(&c->lock);
         lua_pushnil(L);
-        lua_pushstring(L, "kcpframesynclib_client: ikcp_create failed");
+        lua_pushstring(L, "kfsclientlib: ikcp_create failed");
         return 2;
     }
     ikcp_setoutput(c->kcp, kfs_c_output);
@@ -70,11 +70,11 @@ static int kfs_new(lua_State *L)
         c->net = NULL;
         pthread_mutex_destroy(&c->lock);
         lua_pushnil(L);
-        lua_pushstring(L, "kcpframesynclib_client: thread create failed");
+        lua_pushstring(L, "kfsclientlib: thread create failed");
         return 2;
     }
 
-    if (luaL_newmetatable(L, "kcpframesynclib_client")) {
+    if (luaL_newmetatable(L, "kfsclientlib")) {
         static const luaL_Reg methods[] = {
             { "setpeer",       kfs_setpeer       },
             { "join",          kfs_join          },
@@ -97,7 +97,7 @@ static int kfs_new(lua_State *L)
         lua_pushvalue(L, -2);
         lua_rawset(L, -3);
         lua_pushliteral(L, "__metatable");
-        lua_pushliteral(L, "kcpframesynclib_client");
+        lua_pushliteral(L, "kfsclientlib");
         lua_rawset(L, -3);
     }
     lua_setmetatable(L, -2);
@@ -117,7 +117,7 @@ static int kfs_setpeer(lua_State *L)
     peer.sin_family = AF_INET;
     peer.sin_port = htons((uint16_t)port);
     if (inet_pton(AF_INET, ip, &peer.sin_addr) != 1)
-        return luaL_error(L, "kcpframesynclib_client: invalid ip '%s'", ip);
+        return luaL_error(L, "error kfs_client_lua: invalid ip '%s'", ip);
 
     pthread_mutex_lock(&c->lock);
     ret = (c->net && !c->closed) ? net_set_peer(c->net, &peer) : 0;
@@ -192,20 +192,20 @@ static int kfs_send_input(lua_State *L)
     int total, ret;
 
     if (len > (size_t)KFS_FRAME_MAX_DATA)
-        return luaL_error(L, "kcpframesynclib_client: input too large (%zu)", len);
+        return luaL_error(L, "error kfs_client_lua: input too large (%zu)", len);
     total = frame_encode2(pkt, (int)sizeof(pkt), KFS_CMD_INPUT,
                           (uint32_t)(fid & 0xFFFFFFFFu), data, (int)len);
     if (total < 0)
-        return luaL_error(L, "kcpframesynclib_client: frame encode failed");
+        return luaL_error(L, "error kfs_client_lua: frame encode failed");
 
     pthread_mutex_lock(&c->lock);
     if (c->kcp == NULL || c->closed) {
         pthread_mutex_unlock(&c->lock);
-        return luaL_error(L, "kcpframesynclib_client: client closed");
+        return luaL_error(L, "error kfs_client_lua: client closed");
     }
     if (!c->joined || !c->join_ok) {
         pthread_mutex_unlock(&c->lock);
-        return luaL_error(L, "kcpframesynclib_client: not joined, call join() first");
+        return luaL_error(L, "error kfs_client_lua: not joined, call join() first");
     }
     ret = ikcp_send(c->kcp, pkt, total);
     pthread_mutex_unlock(&c->lock);
@@ -224,16 +224,16 @@ static int kfs_send_ready(lua_State *L)
 
     total = frame_encode2(pkt, (int)sizeof(pkt), KFS_CMD_READY, 0, NULL, 0);
     if (total < 0)
-        return luaL_error(L, "kcpframesynclib_client: frame encode failed");
+        return luaL_error(L, "error kfs_client_lua: frame encode failed");
 
     pthread_mutex_lock(&c->lock);
     if (c->kcp == NULL || c->closed) {
         pthread_mutex_unlock(&c->lock);
-        return luaL_error(L, "kcpframesynclib_client: client closed");
+        return luaL_error(L, "error kfs_client_lua: client closed");
     }
     if (!c->joined || !c->join_ok) {
         pthread_mutex_unlock(&c->lock);
-        return luaL_error(L, "kcpframesynclib_client: not joined, call join() first");
+        return luaL_error(L, "error kfs_client_lua: not joined, call join() first");
     }
     ret = ikcp_send(c->kcp, pkt, total);
     pthread_mutex_unlock(&c->lock);
@@ -256,7 +256,7 @@ static int kfs_recv_broadcast(lua_State *L)
     pthread_mutex_lock(&c->lock);
     if (c->kcp == NULL || c->closed) {
         pthread_mutex_unlock(&c->lock);
-        return luaL_error(L, "kcpframesynclib_client: client closed");
+        return luaL_error(L, "error kfs_client_lua: client closed");
     }
     size = ikcp_peeksize(c->kcp);
     if (size < KFS_FRAME2_HEADER_SIZE) {
@@ -265,12 +265,12 @@ static int kfs_recv_broadcast(lua_State *L)
     }
     if (size > KFS_FRAME_MAX_TOTAL) {
         pthread_mutex_unlock(&c->lock);
-        return luaL_error(L, "kcpframesynclib_client: bad frame size %d", size);
+        return luaL_error(L, "error kfs_client_lua: bad frame size %d", size);
     }
     pkt = (char *)malloc((size_t)size);
     if (pkt == NULL) {
         pthread_mutex_unlock(&c->lock);
-        return luaL_error(L, "kcpframesynclib_client: out of memory");
+        return luaL_error(L, "error kfs_client_lua: out of memory");
     }
     ret = ikcp_recv(c->kcp, pkt, size);
     pthread_mutex_unlock(&c->lock);
@@ -281,7 +281,7 @@ static int kfs_recv_broadcast(lua_State *L)
     }
     if (frame_decode2(pkt, ret, &type, &fid, &data, &dlen) != 0) {
         free(pkt);
-        return luaL_error(L, "kcpframesynclib_client: bad frame payload");
+        return luaL_error(L, "error kfs_client_lua: bad frame payload");
     }
     if (type != KFS_CMD_BROADCAST) {
         free(pkt);                 // 非广播帧：丢弃
@@ -320,16 +320,16 @@ static int kfs_report_state(lua_State *L)
                           (uint32_t)(fid & 0xFFFFFFFFu),
                           (const char *)&hh, 4);
     if (total < 0)
-        return luaL_error(L, "kcpframesynclib_client: frame encode failed");
+        return luaL_error(L, "error kfs_client_lua: frame encode failed");
 
     pthread_mutex_lock(&c->lock);
     if (c->kcp == NULL || c->closed) {
         pthread_mutex_unlock(&c->lock);
-        return luaL_error(L, "kcpframesynclib_client: client closed");
+        return luaL_error(L, "error kfs_client_lua: client closed");
     }
     if (!c->joined || !c->join_ok) {
         pthread_mutex_unlock(&c->lock);
-        return luaL_error(L, "kcpframesynclib_client: not joined, call join() first");
+        return luaL_error(L, "error kfs_client_lua: not joined, call join() first");
     }
     ret = ikcp_send(c->kcp, pkt, total);
     pthread_mutex_unlock(&c->lock);
@@ -353,7 +353,7 @@ static int kfs_catch_up(lua_State *L)
     pthread_mutex_lock(&c->lock);
     if (c->kcp == NULL || c->closed) {
         pthread_mutex_unlock(&c->lock);
-        return luaL_error(L, "kcpframesynclib_client: client closed");
+        return luaL_error(L, "error kfs_client_lua: client closed");
     }
     while (1) {
         int size = ikcp_peeksize(c->kcp);
