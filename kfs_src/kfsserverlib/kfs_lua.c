@@ -771,9 +771,9 @@ static int kfs_conn_new_room(lua_State *L)
     }
 
     // 诊断：打印初始玩家登记（临时调试，确认后删除）
-    printf("[server C] new_room room=%u init_count=%d\n", (unsigned)srv->room_id, init_count);
+    print_log(" new_room room=%u init_count=%d\n", (unsigned)srv->room_id, init_count);
     for (i = 0; i < init_count; i++)
-        printf("[server C] 初始玩家 conv=%u\n", (unsigned)init_convs[i]);
+        print_log(" 初始玩家 conv=%u\n", (unsigned)init_convs[i]);
 
     // 为每个初始玩家生成专属 token 并登记到房间实例（per-player 鉴权）
     for (i = 0; i < init_count; i++) {

@@ -391,12 +391,12 @@ static void kfs_room_timeout_tick(kfs_netref *r, kfs_room *room,
 
 static int kfs_room_check_token(kfs_room *room, uint32_t conv, uint32_t token)
 {
-    printf("[server C] JOIN 检验 token conv=%u, token=%u, ptoken_count=%d\n", conv, token, (int)room->ptoken_count);
+    print_log(" JOIN 检验 token conv=%u, token=%u, ptoken_count=%d\n", conv, token, (int)room->ptoken_count);
     int i;
     for (i = 0; i < (int)room->ptoken_count; i++) {
-        printf("[server C] JOIN token 匹配 i=%d, iconv=%u, itoken=%u\n", i, room->ptokens[i].conv, room->ptokens[i].token);
+        print_log(" JOIN token 匹配 i=%d, iconv=%u, itoken=%u\n", i, room->ptokens[i].conv, room->ptokens[i].token);
         if (room->ptokens[i].conv == conv){
-            printf("[server C] JOIN token 匹配 conv=%u, token=%u\n", conv, token);
+            print_log(" JOIN token 匹配 conv=%u, token=%u\n", conv, token);
             if (room->ptokens[i].valid)
                 return room->ptokens[i].token == token;   // 该 conv 有专属 token
             else
@@ -437,7 +437,7 @@ static void kfs_srv_handle_join(kfs_netref *r, uint32_t room_id,
                                 uint32_t conv, uint32_t token,
                                 const struct sockaddr_in *peer)
 {
-    printf("[server C] kfs_srv_handle_join room_id=%d, conv=%u, token=%u\n", room_id, conv, token);
+    print_log(" kfs_srv_handle_join room_id=%d, conv=%u, token=%u\n", room_id, conv, token);
     kfs_room *room = kfs_room_find(r, room_id);
     char ack[5];
     uint32_t m = KFS_HANDSHAKE_MAGIC;
@@ -445,10 +445,10 @@ static void kfs_srv_handle_join(kfs_netref *r, uint32_t room_id,
     int rc;
 
     if (room == NULL) {
-        printf("[server C] kfs_srv_handle_join 房间不存在 room_id=%d, conv=%u, token=%u\n", room_id, conv, token);
+        print_log(" kfs_srv_handle_join 房间不存在 room_id=%d, conv=%u, token=%u\n", room_id, conv, token);
         result = 1;                               // 房间不存在
     } else if (!kfs_room_check_token(room, conv, token)) {
-        printf("[server C] kfs_srv_handle_join token 错误 room_id=%d, conv=%u, token=%u\n", room_id, conv, token);
+        print_log(" kfs_srv_handle_join token 错误 room_id=%d, conv=%u, token=%u\n", room_id, conv, token);
         result = 5;                               // token 错误（鉴权失败）
     } else {
         rc = kfs_srv_add_player_c(r, room, conv, peer);   // 登记玩家并建立连接
@@ -457,7 +457,7 @@ static void kfs_srv_handle_join(kfs_netref *r, uint32_t room_id,
                : (rc == -2) ? 3                   // conv 已在房间
                : 4;                               // 其他
 
-        printf("[server C] kfs_srv_handle_join result=%d room_id=%d, conv=%u, token=%u\n", result, room_id, conv, token);
+        print_log(" kfs_srv_handle_join result=%d room_id=%d, conv=%u, token=%u\n", result, room_id, conv, token);
     }
     memcpy(ack, &m, 4);
     ack[4] = (char)result;
@@ -505,40 +505,43 @@ void *kfs_drive_thread(void *arg)
             pthread_mutex_unlock(&r->lock);
             break;                              // 线程退出
         }
+        now = kfs_now_ms();
+        // 收包：先识别裸 UDP JOIN 握手（带/不带 token），其余按 KCP conv 路由。
+        // 收包必须放在“是否有房间”的判断之外：没有房间时也要回 JOIN 的
+        // result=1，否则客户端只能等到 2s 超时，无法区分“服务器没跑”和“房间号错”。
+        while ((rcv = net_recv(r->net, buf, KFS_NET_MAX_PKT, &from)) > 0) {
+            IUINT32 m, conv;
+            kfs_player *pl;
+            if (rcv < 4)
+                continue;                       // 过短，丢弃
+            memcpy(&m, buf, 4);
+            if (m == KFS_HANDSHAKE_MAGIC &&
+                (rcv == KFS_HS_LEN || rcv == KFS_HS_LEN2)) {
+                uint32_t room_id, jconv, jtok = 0;
+                memcpy(&room_id, buf + 4, 4);
+                memcpy(&jconv, buf + 8, 4);
+                if (rcv >= KFS_HS_LEN2)
+                    memcpy(&jtok, buf + 12, 4);
+                kfs_srv_handle_join(r, room_id, jconv, jtok, &from);
+                continue;
+            }
+            memcpy(&conv, buf, 4);              // KCP 包头 4 字节即 conv（host order）
+            pl = kfs_find_player(r, conv);
+            if (pl) {
+                ikcp_input(pl->kcp, buf, (long)rcv);
+                kfs_player_recv_pump(r, pl, (uint64_t)now);   // 写缓冲/保活
+            } else {
+                ikcpcb *kcp = netref_route_find(r, conv);
+                if (kcp)
+                    ikcp_input(kcp, buf, (long)rcv);
+                // 未匹配的 conv：丢弃（不属于本端口任何房间）
+            }
+        }
+
         if (r->rcount > 0 || r->room_count > 0) {
             // 每个驱动 tick：各房间最多推进一帧（帧率节拍）
             for (i = 0; i < r->room_count; i++)
                 r->rooms[i].tick_done = 0;
-            now = kfs_now_ms();
-            // 收包：先识别裸 UDP JOIN 握手（带/不带 token），其余按 KCP conv 路由
-            while ((rcv = net_recv(r->net, buf, KFS_NET_MAX_PKT, &from)) > 0) {
-                IUINT32 m, conv;
-                kfs_player *pl;
-                if (rcv < 4)
-                    continue;                   // 过短，丢弃
-                memcpy(&m, buf, 4);
-                if (m == KFS_HANDSHAKE_MAGIC &&
-                    (rcv == KFS_HS_LEN || rcv == KFS_HS_LEN2)) {
-                    uint32_t room_id, jconv, jtok = 0;
-                    memcpy(&room_id, buf + 4, 4);
-                    memcpy(&jconv, buf + 8, 4);
-                    if (rcv >= KFS_HS_LEN2)
-                        memcpy(&jtok, buf + 12, 4);
-                    kfs_srv_handle_join(r, room_id, jconv, jtok, &from);
-                    continue;
-                }
-                memcpy(&conv, buf, 4);          // KCP 包头 4 字节即 conv（host order）
-                pl = kfs_find_player(r, conv);
-                if (pl) {
-                    ikcp_input(pl->kcp, buf, (long)rcv);
-                    kfs_player_recv_pump(r, pl, (uint64_t)now);   // 写缓冲/保活
-                } else {
-                    ikcpcb *kcp = netref_route_find(r, conv);
-                    if (kcp)
-                        ikcp_input(kcp, buf, (long)rcv);
-                    // 未匹配的 conv：丢弃（不属于本端口任何房间）
-                }
-            }
             // update 点对点房间
             for (i = 0; i < r->rcount; i++)
                 ikcp_update(r->routes[i].kcp, now);
@@ -575,7 +578,7 @@ void *kfs_drive_thread(void *arg)
                     if (KFS_PLAYER_ONLINE(pl) && !pl->offline &&
                         (uint64_t)now - pl->last_active_ms > room->idle_timeout_ms) {
                         pl->offline = 1;        // 标记掉线：席位保留，等待重连
-                        printf("[server C] 玩家 conv=%u 掉线（席位保留，可重连）\n", pl->conv);
+                        print_log(" 玩家 conv=%u 掉线（席位保留，可重连）\n", pl->conv);
                     }
                 }
             }
@@ -742,7 +745,7 @@ int kfs_srv_add_player_c(kfs_netref *r, kfs_room *room, uint32_t conv,
     pl->state = KFS_PSTATE_ONLINE;             // 升级/恢复在线
     pl->offline = 0;
     pl->last_active_ms = kfs_now_ms();          // join 即视为活跃
-    printf("[server C] kfs_srv_add_player_c 建立/更新连接 conv=%d, room_id=%u", conv, room->room_id);
+    print_log(" kfs_srv_add_player_c 建立/更新连接 conv=%d, room_id=%u\n", conv, room->room_id);
     return 0;
 }
 

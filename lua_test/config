@@ -19,7 +19,7 @@ ttl_ms = 0
 idle_timeout_ms = 2000
 
 # 帧率（每秒帧数）
-frame_rate = 1
+frame_rate = 20
 # 输入提前量窗口（帧）：客户端把输入补发到"当前帧+advance_frames"，
 # 服务器从玩家超前缓冲按帧号取全员输入推进（标准帧同步输入窗口，须 < 服务器缓冲 8）
 advance_frames = 2
@@ -27,7 +27,7 @@ advance_frames = 2
 
 # ---- 自测用的房间参数 ----
 # 测试运行时长（毫秒）
-duration_ms = 5000
+duration_ms = 5000000
 clinten_duration_ms = 2000
 
 

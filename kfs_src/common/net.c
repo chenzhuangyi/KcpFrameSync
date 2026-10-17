@@ -78,6 +78,15 @@ static void set_err(kfs_net *n, const char *fmt, int e)
     }
 }
 
+// bind 失败：需要同时输出端口号和 errno（set_err 只接受一个整数参数）
+static void set_err_bind(kfs_net *n, int port, int e)
+{
+    snprintf(g_last_err, sizeof(g_last_err),
+             "bind port %d failed (errno %d)", port, e);
+    if (n)
+        snprintf(n->errmsg, sizeof(n->errmsg), "%s", g_last_err);
+}
+
 //---------------------------------------------------------------------
 // 内部：向队列压入一个包（接收线程调用）
 //---------------------------------------------------------------------
@@ -134,7 +143,7 @@ kfs_net *net_open(int port)
 {
     kfs_net *n = (kfs_net *)calloc(1, sizeof(kfs_net));
     struct sockaddr_in addr;
-    int flags, on;
+    int flags;
 
     if (n == NULL)
         return NULL;
@@ -150,18 +159,20 @@ kfs_net *net_open(int port)
         return NULL;
     }
 
-    // 非阻塞 + 端口复用
+    // 非阻塞。
+    // 注意：这里不要设 SO_REUSEADDR。UDP + SO_REUSEADDR 允许同一端口被多个
+    // 进程 bind，而内核只会把单播包投给其中一个；重复启动 server.lua 时会
+    // 出现“服务器明明在跑却收不到 JOIN / token 对不上”的假象。禁用后第二个
+    // 实例会在 bind 时直接失败（EADDRINUSE），问题立即暴露。
     flags = fcntl(n->sock, F_GETFL, 0);
     fcntl(n->sock, F_SETFL, flags | O_NONBLOCK);
-    on = 1;
-    setsockopt(n->sock, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
 
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons((uint16_t)port);
     if (bind(n->sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        set_err(n, "bind port %d failed (errno %d)", errno);
+        set_err_bind(n, port, errno);
         close(n->sock);
         n->sock = -1;
         free(n);

@@ -3,7 +3,9 @@
 //=====================================================================
 #include "kfs_common.h"
 
+#include <stdio.h>
 #include <time.h>
+#include <stdarg.h>
 
 // 当前单调时钟毫秒数
 IUINT32 kfs_now_ms(void)
@@ -36,4 +38,31 @@ uint32_t kfs_rng_next(void)
     x ^= x >> 27;
     kfs_rng_state = x;
     return (uint32_t)((x * 0x2545F4914F6CDD1Dull) >> 32);
+}
+
+const char* now_datetime(void) {
+    static char buf[64];
+    time_t t = time(NULL);
+    struct tm *lt = localtime(&t);
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", lt);
+    return buf;
+}
+
+void print_log(const char *fmt, ...) {
+    // 打印时间戳
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    char timebuf[32];
+    strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", t);
+    printf("[server][C][%s] ", timebuf);
+
+    // 打印可变参数内容
+    va_list args;
+    va_start(args, fmt);
+    vprintf(fmt, args);
+    va_end(args);
+
+    // 自动补换行
+    printf("\n");
+    fflush(stdout);
 }
