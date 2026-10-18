@@ -18,6 +18,8 @@
 -- 依赖：Lua 5.4，无第三方 socket 库
 --=====================================================================
 
+require "log"
+
 package.cpath = package.cpath .. ";../kfs_src/build/?.so"
 local kfs = require("kfsclientlib")
 
@@ -54,12 +56,12 @@ local client_count = 0
 local arg = {...}
 local room_id = arg[1]
 if not room_id then
-    print(string.format("[client][lua] 参数为nil"))
+    LOG_DEBUGF(string.format("[client][lua] 参数为nil"))
     return
 end
 room_id = tonumber(room_id)
 if room_id <= 0 then
-    print(string.format("[client][lua] 参数 room_id=%d", room_id))
+    LOG_DEBUGF(string.format("[client][lua] 参数 room_id=%d", room_id))
 end
 
 -- 服务器生成的 per-player token（server.lua 写入 tokens.txt，模拟分发通道）：
@@ -127,7 +129,7 @@ local function make_client(conv)
     return c, conv
 end
 
-print(string.format("[client] 服务器 %s:%d 房间 %d 客户端数=%d 帧率=%d 时长=%dms",
+LOG_DEBUGF(string.format("[client] 服务器 %s:%d 房间 %d 客户端数=%d 帧率=%d 时长=%dms",
       server_ip, tostring(server_port), room_id, client_count,
       frame_rate, duration_ms))
 
@@ -143,19 +145,19 @@ local join_player = 0
 for conv, token in pairs(server_tokens) do
     local c, err = make_client(conv)
     if not c then
-        print(string.format("[client] conv=%d 加入失败: %s", conv, tostring(err)))
+        LOG_DEBUGF(string.format("[client] conv=%d 加入失败: %s", conv, tostring(err)))
     else
         join_player = join_player + 1
         clients[join_player] = c
         convs[join_player] = conv
-        print(string.format("[client%d] 已登记 conv=%d 并上报就绪", join_player, conv))
+        LOG_DEBUGF(string.format("[client%d] 已登记 conv=%d 并上报就绪", join_player, conv))
     end
     os.execute("sleep 0.02")     -- 错开启动，便于观察服务器逐人登记
 end
 
 
 if #clients == 0 then
-    print("[client] 无客户端可用，退出")
+    LOG_DEBUGF("[client] 无客户端可用，退出")
     os.exit(1)
 end
 
@@ -199,7 +201,7 @@ while true do
         local bfid, payload, ok = clients[i]:recv_broadcast()
         if bfid then
             if not ok then
-                print(string.format("[client%d] 对账失败：fid=%d 哈希不一致（不同步）",
+                LOG_DEBUGF(string.format("[client%d] 对账失败：fid=%d 哈希不一致（不同步）",
                       i, bfid))
             end
             local players = parse_broadcast(payload)
@@ -207,7 +209,7 @@ while true do
             for _, p in ipairs(players) do
                 brief[#brief + 1] = "c" .. p.conv .. ":" .. p.data
             end
-            print(string.format("[client%d][%d] 收到广播 fid=%d 玩家数=%d [%s]",
+            LOG_DEBUGF(string.format("[client%d][%d] 收到广播 fid=%d 玩家数=%d [%s]",
                   i, os.time(), bfid, #players, table.concat(brief, " ")))
             -- P0-1 状态对账：对广播帧负载算确定性哈希上报，服务器收集全员
             -- 哈希推进一致点/标记不同步（同一帧全员负载相同 → 哈希一致）。
@@ -230,7 +232,7 @@ while true do
         if target > next_fid then
             next_fid = target
             topup()
-            print(string.format("[client] 全员收到 fid=%d，补发输入到 fid=%d",
+            LOG_DEBUGF(string.format("[client] 全员收到 fid=%d，补发输入到 fid=%d",
                   min_bfid, send_fid))
         end
     end
@@ -247,4 +249,4 @@ end
 for i = 1, #clients do
     clients[i]:close()
 end
-print("[client] 全部客户端已关闭")
+LOG_DEBUGF("[client] 全部客户端已关闭")

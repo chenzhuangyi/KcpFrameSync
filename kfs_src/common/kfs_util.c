@@ -48,21 +48,19 @@ const char* now_datetime(void) {
     return buf;
 }
 
-void print_log(const char *fmt, ...) {
-    // 打印时间戳
-    time_t now = time(NULL);
-    struct tm *t = localtime(&now);
-    char timebuf[32];
-    strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", t);
-    printf("[server][C][%s] ", timebuf);
+// LOG_DEBUGF("Hello, world! %d", 123);
+// [2026-10-18 17:57:04][DEBUG][C][kfs_lua.c:81] Hello, world! 123
+void logf(const char *level, const char *file, int line, const char *fmt, ...) {
+    if (strcmp(level, LOG_LEVEL_DEBUG) < 0 || strcmp(level, LOG_LEVEL_NONE) > 0) return;
 
-    // 打印可变参数内容
-    va_list args;
-    va_start(args, fmt);
-    vprintf(fmt, args);
-    va_end(args);
+    va_list ap;
+    va_start(ap, fmt);
 
-    // 自动补换行
+    printf("[%s][%s][C][%s:%d] ", now_datetime(), level, file, line);
+    vprintf(fmt, ap);
     printf("\n");
+
+    va_end(ap);
     fflush(stdout);
 }
+

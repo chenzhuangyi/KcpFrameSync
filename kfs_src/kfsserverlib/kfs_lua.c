@@ -78,6 +78,7 @@ static int kfs_srv_gc(lua_State *L);
 //=====================================================================
 static int kfs_new(lua_State *L)
 {
+    LOG_DEBUGF("Hello, world! %d", 123);
     lua_Integer port = luaL_checkinteger(L, 1);
     lua_Integer fps  = luaL_optinteger(L, 2, 20);   // frame_rate，默认 20
     uint32_t interval;
@@ -771,9 +772,9 @@ static int kfs_conn_new_room(lua_State *L)
     }
 
     // 诊断：打印初始玩家登记（临时调试，确认后删除）
-    print_log(" new_room room=%u init_count=%d\n", (unsigned)srv->room_id, init_count);
+    LOG_DEBUGF("new_room room=%u init_count=%d", (unsigned)srv->room_id, init_count);
     for (i = 0; i < init_count; i++)
-        print_log(" 初始玩家 conv=%u\n", (unsigned)init_convs[i]);
+    LOG_DEBUGF("初始玩家 conv=%u", (unsigned)init_convs[i]);
 
     // 为每个初始玩家生成专属 token 并登记到房间实例（per-player 鉴权）
     for (i = 0; i < init_count; i++) {

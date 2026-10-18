@@ -321,7 +321,6 @@ static void kfs_player_recv_pump(kfs_netref *r, kfs_player *pl, uint64_t now_ms)
 
         if (type == KFS_CMD_HEARTBEAT) {
             pl->last_active_ms = now_ms;        // 保活：刷新活跃时间
-            // printf("心跳 conv=%u, now=%u\n", pl->conv, (uint32_t)now_ms);
             continue;
         }
         if (type == KFS_CMD_READY) {
@@ -391,12 +390,12 @@ static void kfs_room_timeout_tick(kfs_netref *r, kfs_room *room,
 
 static int kfs_room_check_token(kfs_room *room, uint32_t conv, uint32_t token)
 {
-    print_log(" JOIN 检验 token conv=%u, token=%u, ptoken_count=%d\n", conv, token, (int)room->ptoken_count);
+    LOG_DEBUGF(" JOIN 检验 token conv=%u, token=%u, ptoken_count=%d", conv, token, (int)room->ptoken_count);
     int i;
     for (i = 0; i < (int)room->ptoken_count; i++) {
-        print_log(" JOIN token 匹配 i=%d, iconv=%u, itoken=%u\n", i, room->ptokens[i].conv, room->ptokens[i].token);
+        LOG_DEBUGF(" JOIN token 匹配 i=%d, iconv=%u, itoken=%u", i, room->ptokens[i].conv, room->ptokens[i].token);
         if (room->ptokens[i].conv == conv){
-            print_log(" JOIN token 匹配 conv=%u, token=%u\n", conv, token);
+            LOG_DEBUGF(" JOIN token 匹配 conv=%u, token=%u", conv, token);
             if (room->ptokens[i].valid)
                 return room->ptokens[i].token == token;   // 该 conv 有专属 token
             else
@@ -437,7 +436,7 @@ static void kfs_srv_handle_join(kfs_netref *r, uint32_t room_id,
                                 uint32_t conv, uint32_t token,
                                 const struct sockaddr_in *peer)
 {
-    print_log(" kfs_srv_handle_join room_id=%d, conv=%u, token=%u\n", room_id, conv, token);
+    LOG_DEBUGF(" kfs_srv_handle_join room_id=%d, conv=%u, token=%u", room_id, conv, token);
     kfs_room *room = kfs_room_find(r, room_id);
     char ack[5];
     uint32_t m = KFS_HANDSHAKE_MAGIC;
@@ -445,10 +444,10 @@ static void kfs_srv_handle_join(kfs_netref *r, uint32_t room_id,
     int rc;
 
     if (room == NULL) {
-        print_log(" kfs_srv_handle_join 房间不存在 room_id=%d, conv=%u, token=%u\n", room_id, conv, token);
+        LOG_DEBUGF(" kfs_srv_handle_join 房间不存在 room_id=%d, conv=%u, token=%u", room_id, conv, token);
         result = 1;                               // 房间不存在
     } else if (!kfs_room_check_token(room, conv, token)) {
-        print_log(" kfs_srv_handle_join token 错误 room_id=%d, conv=%u, token=%u\n", room_id, conv, token);
+        LOG_DEBUGF(" kfs_srv_handle_join token 错误 room_id=%d, conv=%u, token=%u", room_id, conv, token);
         result = 5;                               // token 错误（鉴权失败）
     } else {
         rc = kfs_srv_add_player_c(r, room, conv, peer);   // 登记玩家并建立连接
@@ -457,7 +456,7 @@ static void kfs_srv_handle_join(kfs_netref *r, uint32_t room_id,
                : (rc == -2) ? 3                   // conv 已在房间
                : 4;                               // 其他
 
-        print_log(" kfs_srv_handle_join result=%d room_id=%d, conv=%u, token=%u\n", result, room_id, conv, token);
+        LOG_DEBUGF(" kfs_srv_handle_join result=%d room_id=%d, conv=%u, token=%u", result, room_id, conv, token);
     }
     memcpy(ack, &m, 4);
     ack[4] = (char)result;
@@ -578,7 +577,7 @@ void *kfs_drive_thread(void *arg)
                     if (KFS_PLAYER_ONLINE(pl) && !pl->offline &&
                         (uint64_t)now - pl->last_active_ms > room->idle_timeout_ms) {
                         pl->offline = 1;        // 标记掉线：席位保留，等待重连
-                        print_log(" 玩家 conv=%u 掉线（席位保留，可重连）\n", pl->conv);
+                        LOG_DEBUGF("玩家 conv=%u 掉线（席位保留，可重连）", pl->conv);
                     }
                 }
             }
@@ -745,7 +744,7 @@ int kfs_srv_add_player_c(kfs_netref *r, kfs_room *room, uint32_t conv,
     pl->state = KFS_PSTATE_ONLINE;             // 升级/恢复在线
     pl->offline = 0;
     pl->last_active_ms = kfs_now_ms();          // join 即视为活跃
-    print_log(" kfs_srv_add_player_c 建立/更新连接 conv=%d, room_id=%u\n", conv, room->room_id);
+    LOG_DEBUGF("kfs_srv_add_player_c 建立/更新连接 conv=%d, room_id=%u", conv, room->room_id);
     return 0;
 }
 
