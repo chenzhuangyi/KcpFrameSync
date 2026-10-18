@@ -63,7 +63,7 @@ const envServerFamily = process.env.KFS_SERVER_FAMILY || '';
 const cfg = {
   serverHost: envServerHost || '127.0.0.1',
   serverFamily: envServerFamily || 'udp4',
-  serverPort: parseInt(process.env.KFS_SERVER_PORT || '10500', 10),
+  serverPort: parseInt(process.env.KFS_SERVER_PORT || '10501', 10),
   wsPort: parseInt(process.env.WS_PORT || '8081', 10),
   updateMs: parseInt(process.env.KFS_UPDATE_MS || '5', 10),
   joinTimeoutMs: parseInt(process.env.KFS_JOIN_TIMEOUT_MS || '2000', 10),

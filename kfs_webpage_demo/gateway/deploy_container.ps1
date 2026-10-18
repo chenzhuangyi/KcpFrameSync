@@ -16,16 +16,18 @@ $container = 'ctn_centos7'
 docker exec $container mkdir -p /root/kfs-gateway/node_modules
 docker cp "$here\gateway.js" "${container}:/root/kfs-gateway/gateway.js"
 docker cp "$here\ikcp.js" "${container}:/root/kfs-gateway/ikcp.js"
+docker cp "$here\bridge_container.js" "${container}:/root/kfs-gateway/bridge_container.js"
 docker exec $container rm -rf /root/kfs-gateway/node_modules/ws
 docker cp "$here\node_modules\ws" "${container}:/root/kfs-gateway/node_modules/ws"
 docker cp "$here\start_container.sh" "${container}:/root/kfs-gateway/start_container.sh"
 docker exec $container chmod +x /root/kfs-gateway/start_container.sh
 
-# Stop the old gateway only; server.lua keeps running.
-docker exec $container sh -lc "pkill -f '[g]ateway.js' || true"
+# Stop old gateway/bridge only; server.lua keeps running.
+docker exec $container sh -lc "pkill -f '[g]ateway.js' || true; pkill -f '[b]ridge_container.js' || true"
 Start-Sleep -Milliseconds 500
 docker exec $container /root/kfs-gateway/start_container.sh
 
 Write-Output ""
 Write-Output "Container gateway updated: ws://127.0.0.1:18080"
-Write-Output "Set the web gateway address to ws://127.0.0.1:18080, Ctrl+F5, then click 2."
+Write-Output "Container Unity bridge updated: tcp/10500 -> udp/10500"
+Write-Output "Web: set gateway ws://127.0.0.1:18080. Unity: setpeer('127.0.0.1', 10501) with bridge_windows.js running."

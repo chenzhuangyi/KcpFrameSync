@@ -1,0 +1,8 @@
+[bridge] container bridge listening tcp/10500 -> udp 127.0.0.1:10500
+[bridge] open 127.0.0.1:52740 -> udp 127.0.0.1:51865
+[bridge] close 127.0.0.1:52740 udp=51865 (idle)
+[bridge] open 127.0.0.1:46274 -> udp 127.0.0.1:40294
+[bridge] open 127.0.0.1:39484 -> udp 127.0.0.1:47275
+[bridge] close 127.0.0.1:46274 udp=40294 (idle)
+[bridge] close 127.0.0.1:39484 udp=47275 (tcp end)
+[bridge] open 127.0.0.1:48590 -> udp 127.0.0.1:44366

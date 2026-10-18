@@ -10,6 +10,19 @@ $ npm install
 $ node gateway.js
 ```
 
+* 如果udp帧同步服务器是运行在docker,windows宿主机的直接发到docker的udp端口会丢包
+* 客户端跑在宿主机，我在windows宿主机写一个 TCP -> UDP 桥（node bridge_windows.js）
+```shell
+$ node bridge_windows.js
+```
+显示：
+[bridge] windows bridge udp 127.0.0.1:10501 -> tcp 127.0.0.1:10500
+[bridge] Unity kfs 客户端 setpeer("127.0.0.1", 10501)
+
+* 还有一种方法比如我的网页demo的网关也部署到docker路面（start_container.sh）
+
+
+
 * 客户端（也可使用任意方法启动一个web服务）
 ```shell
 $ cd client
