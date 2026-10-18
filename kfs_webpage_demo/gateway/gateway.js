@@ -40,6 +40,7 @@
 
 const dgram = require('dgram');
 const fs = require('fs');
+const path = require('path');
 const { execFile, execFileSync } = require('child_process');
 const { WebSocketServer } = require('ws');
 const ikcp = require('./ikcp.js');
@@ -60,10 +61,27 @@ const FNV_PRIME = 16777619;
 const envServerHost = process.env.KFS_SERVER_HOST || '';
 const envServerFamily = process.env.KFS_SERVER_FAMILY || '';
 
+// 网关目标 UDP 端口：KFS_SERVER_PORT > <项目>/lua_test/config 的 udp_port > 10500。
+// 目录调整后如果只改了 config 的端口，网关也能自动跟上，不会再出现
+// “服务器在跑却 JOIN 超时”（端口和目标对不上）。
+function readConfigUdpPort() {
+  const candidates = [
+    path.join(__dirname, '..', 'lua_test', 'config'),
+    path.join(__dirname, 'lua_test', 'config'),
+  ];
+  for (const p of candidates) {
+    try {
+      const m = fs.readFileSync(p, 'utf8').match(/^\s*udp_port\s*=\s*"?(\d+)/m);
+      if (m) return parseInt(m[1], 10);
+    } catch (e) { /* 试下一个位置 */ }
+  }
+  return 0;
+}
+
 const cfg = {
   serverHost: envServerHost || '127.0.0.1',
   serverFamily: envServerFamily || 'udp4',
-  serverPort: parseInt(process.env.KFS_SERVER_PORT || '10501', 10),
+  serverPort: parseInt(process.env.KFS_SERVER_PORT || String(readConfigUdpPort() || 10500), 10),
   wsPort: parseInt(process.env.WS_PORT || '8081', 10),
   updateMs: parseInt(process.env.KFS_UPDATE_MS || '5', 10),
   joinTimeoutMs: parseInt(process.env.KFS_JOIN_TIMEOUT_MS || '2000', 10),
@@ -270,18 +288,20 @@ class Session {
       this.joinTimer = setTimeout(() => {
         if (this.joined) return;
         // 区分“一个 UDP 包都没收到”和“收到了包但没有 JOIN 应答”：
-        //   前者几乎都是宿主机到 Docker 的 UDP 端口映射失效（Windows 上没有
-        //   UDP 10500 监听），JOIN 包根本没进容器；后者才可能是 room/协议问题。
+        //   前者说明网关目标不可达：容器内网关一般是 server.lua 没起/端口不一致，
+        //   Windows 网关则多半是 Docker 的 UDP 端口代理丢失；后者才是 room/token 问题。
         let hint;
         if (this.udpRx === 0) {
+          const target = `${this.serverHost || cfg.serverHost}:${cfg.serverPort}`;
           hint =
-            `2s 内没有收到任何 UDP 回包：${this.serverHost || cfg.serverHost}:${cfg.serverPort}/udp (${this.udpFamily || cfg.serverFamily}) 不可达。\n` +
-            `      最常见原因：Docker Desktop 的 UDP 端口代理丢失，或只监听在 IPv6 [::]:${cfg.serverPort} 而网关用了 IPv4。\n` +
-            `      在 Windows 执行: netstat -ano -p UDP | findstr :${cfg.serverPort}\n` +
-            `      若没有输出 → docker restart ${cfg.dockerContainer}（或重启 Docker Desktop），再启动 server.lua。\n` +
-            `      若只有 [::]:${cfg.serverPort} → 网关应自动用 IPv6；可设 KFS_SERVER_FAMILY=udp6 强制。\n` +
-            `      当前使用 ${this.udpFamily || cfg.serverFamily}；若仍失败可试 KFS_SERVER_FAMILY=${(this.udpFamily || cfg.serverFamily) === 'udp6' ? 'udp4' : 'udp6'} 重启网关。\n` +
-            `      若已有输出但仍失败 → 检查 Windows 防火墙是否拦截了 Node 的 UDP 出站。`;
+            `2s 内没有收到任何 UDP 回包：${target}/udp (${this.udpFamily || cfg.serverFamily}) 不可达。\n` +
+            `      先确认 server.lua 在跑（容器内: pgrep -af 'lua server.lua'），且它监听的 udp_port 与网关目标端口一致。\n` +
+            (cfg.serverPort === 10501
+              ? `      当前目标是 10501：这是 bridge_windows.js 的 UDP 口，必须同时有 bridge_container.js 在容器内运行；\n` +
+                `      直连 Docker 服务器请把 KFS_SERVER_PORT 改回 10500（或看 lua_test/config 的 udp_port）。\n`
+              : `      网关在容器内时目标应是 127.0.0.1:${cfg.serverPort}；网关在 Windows 时先查 Docker 的 UDP 代理：\n` +
+                `      netstat -ano -p UDP | findstr :${cfg.serverPort}（没有输出就 docker restart ${cfg.dockerContainer}）。\n`) +
+            `      端口可用 KFS_SERVER_PORT 覆盖；网关启动 banner 会打印实际目标端口。`;
         } else {
           hint =
             `收到 ${this.udpRx} 个 UDP 包但没有 JOIN 应答：请确认 room_id=${this.roomId} 已由 server.lua 创建、` +
@@ -323,8 +343,12 @@ class Session {
       this.sendJson({ op: 'tokens', room_id: room, tokens, frame_rate: frameRate });
     };
     const fail = (detail) => {
-      console.log(`[gw#${this.id}] 读取 token 失败: ${detail}`);
-      this.sendJson({ op: 'tokens', room_id: room, error: detail });
+      const where = cfg.localTokensDir
+        ? `容器内目录 ${dir}`
+        : `容器 ${cfg.dockerContainer} 的 ${dir}`;
+      const msg = `${detail}（${where}；容器名可用 KFS_DOCKER_CONTAINER 覆盖，目录可用 KFS_DOCKER_LUA_DIR 覆盖）`;
+      console.log(`[gw#${this.id}] 读取 token 失败: ${msg}`);
+      this.sendJson({ op: 'tokens', room_id: room, error: msg });
     };
 
     // 网关跑在容器内：直接读本地文件，不依赖 docker CLI

@@ -1,33 +1,44 @@
-#=====================================================================
-# deploy_container.ps1 - sync gateway.js / ikcp.js into the container
-# and restart the in-container gateway (ws://0.0.0.0:18080).
+﻿#=====================================================================
+# deploy_container.ps1 - 把本机 gateway 目录里的网关文件同步进容器，
+# 并重启容器内网关（ws://0.0.0.0:18080）。
 #
-# Usage (from the gateway directory):
+# 用法（在 gateway 目录）：
 #   pwsh -ExecutionPolicy Bypass -File .\deploy_container.ps1
-#   or: powershell -ExecutionPolicy Bypass -File .\deploy_container.ps1
+#   powershell -ExecutionPolicy Bypass -File .\deploy_container.ps1
 #
-# The in-container gateway talks to 127.0.0.1:10500/udp directly and
-# does not depend on Docker Desktop's host UDP port proxy.
+# 环境变量：
+#   KFS_DOCKER_CONTAINER  容器名，默认 ctn_centos7
+#   KFS_CONTAINER_ROOT    容器内项目根目录，默认 /root/project/KcpFrameSync
+#
+# 容器内网关直连 127.0.0.1:<config 的 udp_port>/udp，不依赖 Docker Desktop
+# 的宿主机 UDP 端口代理；浏览器只走 TCP 18080。
 #=====================================================================
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-$container = 'ctn_centos7'
 
-docker exec $container mkdir -p /root/kfs-gateway/node_modules
-docker cp "$here\gateway.js" "${container}:/root/kfs-gateway/gateway.js"
-docker cp "$here\ikcp.js" "${container}:/root/kfs-gateway/ikcp.js"
-docker cp "$here\bridge_container.js" "${container}:/root/kfs-gateway/bridge_container.js"
-docker exec $container rm -rf /root/kfs-gateway/node_modules/ws
-docker cp "$here\node_modules\ws" "${container}:/root/kfs-gateway/node_modules/ws"
-docker cp "$here\start_container.sh" "${container}:/root/kfs-gateway/start_container.sh"
-docker exec $container chmod +x /root/kfs-gateway/start_container.sh
+$container = if ($env:KFS_DOCKER_CONTAINER) { $env:KFS_DOCKER_CONTAINER } else { 'ctn_centos7' }
+$containerRoot = if ($env:KFS_CONTAINER_ROOT) { $env:KFS_CONTAINER_ROOT } else { '/root/project/KcpFrameSync' }
+$gatewayDest = "$containerRoot/kfs-gateway"
 
-# Stop old gateway/bridge only; server.lua keeps running.
-docker exec $container sh -lc "pkill -f '[g]ateway.js' || true; pkill -f '[b]ridge_container.js' || true"
-Start-Sleep -Milliseconds 500
-docker exec $container /root/kfs-gateway/start_container.sh
+Write-Output "容器: $container"
+Write-Output "目标: ${container}:$gatewayDest"
+
+docker exec $container mkdir -p "$gatewayDest/node_modules"
+foreach ($f in @('gateway.js', 'ikcp.js', 'bridge_container.js', 'start_container.sh')) {
+    if (-not (Test-Path (Join-Path $here $f))) {
+        throw "缺少文件: $(Join-Path $here $f)"
+    }
+    docker cp "$here\$f" "${container}:$gatewayDest/$f"
+}
+
+docker exec $container rm -rf "$gatewayDest/node_modules/ws"
+docker cp "$here\node_modules\ws" "${container}:$gatewayDest/node_modules/ws"
+docker exec $container chmod +x "$gatewayDest/start_container.sh"
+
+# 只重启网关和桥；server.lua 保持运行（token 不变，网页里已有的 token 继续有效）
+docker exec -e RESTART_GATEWAY=1 $container "$gatewayDest/start_container.sh"
 
 Write-Output ""
-Write-Output "Container gateway updated: ws://127.0.0.1:18080"
-Write-Output "Container Unity bridge updated: tcp/10500 -> udp/10500"
-Write-Output "Web: set gateway ws://127.0.0.1:18080. Unity: setpeer('127.0.0.1', 10501) with bridge_windows.js running."
+Write-Output "容器内网关已更新: ws://127.0.0.1:18080"
+Write-Output "容器内 Unity 桥已更新: tcp/10500 -> udp/<udp_port>"
+Write-Output "网页网关地址填 ws://127.0.0.1:18080；Unity 用 bridge_windows.js 时 setpeer('127.0.0.1', 10501)。"

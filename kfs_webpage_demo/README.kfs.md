@@ -25,13 +25,20 @@
 容器已发布 `10500/udp`、`10500/tcp`、`18080/tcp`。在 Windows 执行：
 
 ```powershell
-docker exec ctn_centos7 /root/kfs-gateway/start_container.sh
+docker exec ctn_centos7 /root/project/KcpFrameSync/kfs-gateway/start_container.sh
+# 或者直接双击/执行 kfs-gateway\start_container.bat
 ```
 
 脚本会：
 - 若 `server.lua` 没在跑，启动 `server.lua 1 1`（单人房，conv=101）；
-- 启动**容器内网关** `ws://0.0.0.0:18080`，它直连容器内 `127.0.0.1:10500/udp`；
+- 启动**容器内网关** `ws://0.0.0.0:18080`，它直连容器内 `127.0.0.1:<udp_port>/udp`；
+- 启动 Unity 用的容器内桥 `tcp/10500 -> udp/<udp_port>`；
 - 打印本次启动生成的 `tokens_1.txt`。
+
+> 脚本会先 `cd` 到自己所在目录，再按 `../kfs_src`、`../lua_test` 定位，
+> 所以 `docker exec` 的工作目录是 `/` 也不影响（之前相对路径就是在这里失效的）。
+> 改过网关代码或端口后，用 `docker exec -e RESTART_GATEWAY=1 ctn_centos7 /root/project/KcpFrameSync/kfs-gateway/start_container.sh` 重启网关。
+> UDP 端口默认读 `lua_test/config` 的 `udp_port`，也可以用 `KFS_SERVER_PORT` 覆盖。
 
 > **为什么网关要跑在容器里？**  
 > Docker Desktop 的宿主机 UDP 端口代理会间歇性丢失，或只监听 IPv6 `[::]:10500`，
@@ -43,7 +50,7 @@ docker exec ctn_centos7 /root/kfs-gateway/start_container.sh
 ### 2. 起网页静态服务器（本机）
 
 ```powershell
-cd D:\project\LockstepDemo-master\client
+cd D:\project\KcpFrameSync\kfs_webpage_demo\client
 python -m http.server 8080 --bind 127.0.0.1
 ```
 
@@ -63,7 +70,7 @@ http://127.0.0.1:8080/?v=20261018d
 不想用容器内网关时：
 
 ```powershell
-cd D:\project\LockstepDemo-master\gateway
+cd D:\project\KcpFrameSync\kfs_webpage_demo\gateway
 node gateway.js
 ```
 
@@ -132,7 +139,7 @@ UDP 端口代理，可能间歇性超时；新版网关会自动尝试 IPv4/IPv6
 | --- | --- | --- |
 | `KFS_SERVER_HOST` | 自动 | kfs 服务器地址；不填则按 Windows UDP 监听自动选 IPv4/IPv6 |
 | `KFS_SERVER_FAMILY` | `auto` | `udp4` / `udp6` / `auto`；Docker 只发布 `[::]:10500` 时用 `udp6` |
-| `KFS_SERVER_PORT` | `10500` | kfs 服务器 UDP 端口 |
+| `KFS_SERVER_PORT` | 读 `config` 的 `udp_port`，缺省 `10500` | kfs 服务器 UDP 端口 |
 | `WS_PORT` | `8081` | 网关 WebSocket 端口（浏览器连接） |
 | `KFS_UPDATE_MS` | `5` | 驱动节奏（对齐 C 客户端 1ms 节流） |
 | `KFS_JOIN_TIMEOUT_MS` | `2000` | JOIN 应答等待超时（对齐 C 客户端 join 2s） |
@@ -145,7 +152,7 @@ UDP 端口代理，可能间歇性超时；新版网关会自动尝试 IPv4/IPv6
 ## 五、无需 Docker 的自测
 
 ```powershell
-cd D:\project\LockstepDemo-master\gateway
+cd D:\project\KcpFrameSync\kfs_webpage_demo\gateway
 $env:KFS_SERVER_PORT="10999"; $env:WS_PORT="8082"
 node gateway.js            # 另开一个终端
 node test_gateway.js       # 本地假 kfs 服务器验证整条链路
@@ -173,6 +180,32 @@ node test_gateway.js       # 本地假 kfs 服务器验证整条链路
 > **推荐直接使用容器内网关 18080**（见第一节）。它走 loopback UDP，完全绕开下面描述的
 > Docker Desktop UDP 端口代理问题；本节只针对“本机 Windows 网关 8081”这条可选路径。
 
+### 症状 0：网页一打开/点①就提示 `读取 token 失败：网关未启动？`
+
+这条提示是**浏览器连不上 WebSocket**，不是 token 文件读不到，先分清端口：
+
+| 网页网关地址 | 谁在监听 | 起不来时怎么修 |
+| --- | --- | --- |
+| `ws://127.0.0.1:18080`（默认） | 容器内 `gateway.js` | `docker exec -e RESTART_GATEWAY=1 ctn_centos7 /root/project/KcpFrameSync/kfs-gateway/start_container.sh` |
+| `ws://127.0.0.1:8081` | Windows 上 `node gateway.js` | 在 `kfs_webpage_demo\gateway` 里执行 `node gateway.js` |
+
+注意 `docker ps` 显示 `0.0.0.0:18080->18080/tcp`、`netstat` 能看到 18080 在监听，
+**并不代表容器里有网关**：Docker 的 TCP 代理会先接受连接。用下面命令看容器内进程：
+
+```powershell
+docker exec ctn_centos7 sh -lc "ps -eo pid,args | grep '[g]ateway.js'"
+```
+
+没有输出就是根因，按上表重启容器网关。目录调整后如果 `start_container.sh` 用的是
+相对路径（`../lua_test`），而 `docker exec` 的工作目录是 `/`，脚本会直接退出、
+18080 自然没有监听——新版脚本已改为按自身位置定位，见第一节。
+
+一键诊断（在 `kfs_webpage_demo\gateway` 目录）：
+
+```powershell
+node doctor.js
+```
+
 ### 症状 A：日志停在 `JOIN 已发送`，2s 后 `JOIN 应答超时`
 
 这几乎都是**宿主机 → Docker 的 UDP 链路没通**，不是网关或 KCP 协议问题。
@@ -191,6 +224,11 @@ netstat -ano -p UDP | findstr :10500
 docker restart ctn_centos7
 # 容器重启后重新启动 server.lua（见下面“只保留一个 server.lua”）
 ```
+
+如果网关日志里的目标端口不是 10500（例如 `UDP 目标 127.0.0.1:10501`），说明走的是
+`bridge_windows.js -> bridge_container.js` 桥链路，必须两个桥都在运行；直连 Docker
+服务器时不要用 10501，设 `KFS_SERVER_PORT=10500`（网关默认也会读 `lua_test/config`
+的 `udp_port`）后重启网关。
 
 ### 症状 A2：有 UDP 监听，但网关仍 JOIN 超时（IPv6-only 发布）
 
@@ -273,11 +311,11 @@ Unity --UDP 127.0.0.1:10501--> bridge_windows.js
 
 ```powershell
 # 1. 容器内：server + 网页网关 + UDP/TCP 桥
-docker exec ctn_centos7 /root/kfs-gateway/start_container.sh 1 1
+docker exec ctn_centos7 /root/project/KcpFrameSync/kfs-gateway/start_container.sh 1 1
 # 双人房用 1 2
 
 # 2. Windows：启动本机桥（保持这个终端开着）
-cd D:\project\LockstepDemo-master\gateway
+cd D:\project\KcpFrameSync\kfs_webpage_demo\gateway
 node bridge_windows.js
 ```
 

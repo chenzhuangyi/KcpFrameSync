@@ -107,8 +107,8 @@ Client.prototype.connect=function(){
 		renderStatus();
 	};
 	this.ws.onerror=function(){
-		self.log("WebSocket 错误（网关未启动？检查 gateway.js 是否运行）");
-		setConnStatus("❌ WebSocket 错误：网关未启动？先运行 node gateway.js", "err");
+		self.log("WebSocket 错误：连不上网关 "+self.wsUrl);
+		setConnStatus("❌ WebSocket 错误：连不上网关 "+self.wsUrl+"（18080 需容器内网关；8081 需本机 node gateway.js）", "err");
 	};
 };
 Client.prototype.send=function(obj){
@@ -271,9 +271,9 @@ function fetchTokens(onDone, silent){
 		if(done) return;
 		done=true;
 		try{ ws.close(); }catch(e){}
-		if(!silent) showTips("读取 token 超时：网关没启动？");
+		if(!silent) showTips("读取 token 超时：网关 "+wsUrl+" 无响应（容器网关 18080 需先跑 start_container.sh；本机网关 8081 需 node gateway.js）");
 		finish(null);
-	},4000);
+	},6000);
 	try{ ws=new WebSocket(wsUrl); }
 	catch(e){
 		clearTimeout(timer);
@@ -315,7 +315,7 @@ function fetchTokens(onDone, silent){
 	ws.onerror=function(){
 		if(done) return;
 		done=true; clearTimeout(timer);
-		if(!silent) showTips("读取 token 失败：网关未启动？");
+		if(!silent) showTips("读取 token 失败：连不上网关 "+wsUrl+"（18080=容器内网关，需先在容器执行 kfs-gateway/start_container.sh；8081=本机 node gateway.js）");
 		finish(null);
 	};
 }
@@ -358,8 +358,8 @@ function startClient(){
 		showTips("token 为空，正在自动读取当前 token...");
 		fetchTokens(function(hit){
 			if(!hit){
-				showTips("读取 token 失败：请确认网关和 server.lua 已启动");
-				setConnStatus("❌ 读取 token 失败：请确认网关和 server.lua 已启动", "err");
+				showTips("读取 token 失败：确认网关 "+wsUrl+" 和 server.lua 已启动");
+				setConnStatus("❌ 读取 token 失败：确认网关 "+wsUrl+" 和 server.lua 已启动", "err");
 				return;
 			}
 			startClient();

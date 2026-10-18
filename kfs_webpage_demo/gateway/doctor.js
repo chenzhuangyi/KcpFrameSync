@@ -18,14 +18,22 @@
 'use strict';
 
 const dgram = require('dgram');
-const net = require('net');
 const { execFileSync } = require('child_process');
+
+// 有 ws 模块时用真正的 WebSocket 探测：Docker 的 TCP 端口代理会“接受连接”，
+// 即使容器里根本没有网关在监听 18080，net.connect 也会显示“可连接”，非常误导。
+let WebSocket = null;
+try { WebSocket = require('ws'); } catch (e) { /* 没有 ws 就退回 TCP 探测 */ }
+
+const LUA_DIR = process.env.KFS_DOCKER_LUA_DIR || '/root/project/KcpFrameSync/lua_test';
 
 const cfg = {
   host: process.env.KFS_SERVER_HOST || '127.0.0.1',
   port: parseInt(process.env.KFS_SERVER_PORT || '10500', 10),
   container: process.env.KFS_DOCKER_CONTAINER || 'ctn_centos7',
-  luaDir: process.env.KFS_DOCKER_LUA_DIR || '/root/project/KcpFrameSync/lua_test',
+  luaDir: LUA_DIR,
+  gatewayDir: process.env.KFS_CONTAINER_GATEWAY_DIR
+    || LUA_DIR.replace(/\/lua_test\/?$/, '/kfs-gateway'),
   room: parseInt(process.env.KFS_ROOM_ID || process.argv[2] || '1', 10),
 };
 
@@ -54,19 +62,32 @@ function hr(title) {
   console.log(`\n=== ${title} ===`);
 }
 
-function checkTcp(host, port) {
+// 用 {op:"tokens"} 真正问一次网关：能回 tokens 才说明容器里 gateway.js 活着，
+// 而不只是 Docker 在 18080 上开了个 TCP 代理。
+function probeGateway(port, room) {
   return new Promise((resolve) => {
-    const s = net.connect({ host, port });
+    if (!WebSocket) {
+      return resolve({ ok: false, reason: '未安装 ws 模块（在 gateway 目录执行 npm install）' });
+    }
+    const ws = new WebSocket(`ws://127.0.0.1:${port}`);
     let done = false;
-    const finish = (ok) => {
+    const finish = (v) => {
       if (done) return;
       done = true;
-      try { s.destroy(); } catch (e) { /* 忽略 */ }
-      resolve(ok);
+      clearTimeout(timer);
+      try { ws.terminate(); } catch (e) { /* 忽略 */ }
+      resolve(v);
     };
-    s.setTimeout(1200, () => finish(false));
-    s.on('connect', () => finish(true));
-    s.on('error', () => finish(false));
+    const timer = setTimeout(() => finish({
+      ok: false, reason: '3s 内没有收到 WebSocket 应答（TCP 能连，但容器里没有网关在监听）',
+    }), 3000);
+    ws.on('open', () => ws.send(JSON.stringify({ op: 'tokens', room_id: room })));
+    ws.on('message', (data) => {
+      let m;
+      try { m = JSON.parse(String(data)); } catch (e) { return; }
+      if (m.op === 'tokens') finish({ ok: true, tokens: m.tokens || [], error: m.error || '' });
+    });
+    ws.on('error', (e) => finish({ ok: false, reason: e.message }));
   });
 }
 
@@ -209,17 +230,23 @@ async function main() {
   const tokens = docker.ok ? readTokens(container) : [];
 
   hr('容器内网关（推荐路径 18080）');
-  const gw18080 = await checkTcp('127.0.0.1', 18080);
+  const gwProbe = await probeGateway(18080, cfg.room);
+  const gw18080 = gwProbe.ok;
   let gwRunning = false;
   if (docker.ok) {
     const r = run('docker', ['exec', container, 'sh', '-c', "ps -eo pid,args | grep '[g]ateway.js'"]);
     gwRunning = !!(r.out && r.out.trim());
     if (r.out && r.out.trim()) console.log(`  ${r.out.trim()}`);
   }
-  console.log(gw18080 ? '  ✓ 127.0.0.1:18080 可连接（浏览器默认走这条）' : '  ✗ 127.0.0.1:18080 不可连接');
+  if (gw18080) {
+    console.log(`  ✓ 18080 WebSocket 应答正常（token ${gwProbe.error ? '读取失败: ' + gwProbe.error : '读取成功，共 ' + gwProbe.tokens.length + ' 个'}）`);
+  } else {
+    console.log(`  ✗ 18080 不可用: ${gwProbe.reason}`);
+  }
   console.log(gwRunning ? '  ✓ 容器内 gateway.js 在运行' : '  ✗ 容器内 gateway.js 没在运行');
   if (!gw18080 || !gwRunning) {
-    console.log(`    修复: docker exec ${container} /root/kfs-gateway/start_container.sh`);
+    console.log(`    修复: docker exec ${container} ${cfg.gatewayDir}/start_container.sh`);
+    console.log(`    或:   docker exec ${container} env RESTART_GATEWAY=1 ${cfg.gatewayDir}/start_container.sh`);
   }
 
   hr('从宿主机发 JOIN 探测（本机 8081 网关路径）');
@@ -260,18 +287,18 @@ async function main() {
   if (gw18080 && gwRunning) {
     console.log('  推荐路径 18080 正常：网页网关地址填 ws://127.0.0.1:18080，Ctrl+F5 后点②。');
     console.log('  下面的 10500 UDP 探测只用于本机 8081 网关，失败可以忽略。');
-  } else if (!win.ok) {
-    console.log('  Windows 宿主机没有 UDP 端口代理（只影响本机 8081 网关）。');
-    console.log(`  推荐改用容器内网关: docker exec ${container} /root/kfs-gateway/start_container.sh`);
-    console.log(`  或修复 UDP 代理: docker restart ${container}，然后重启 server.lua。`);
-  } else if (count > 1) {
-    console.log('  宿主机 UDP 正常，但容器里有多个 server.lua，先清理到只剩一个。');
-  } else if (tokens.length > 0) {
-    console.log('  宿主机 UDP 监听正常，且能从宿主机收到 JOIN 应答。');
-    if (used) console.log(`  实际可用地址: ${used.host}:${cfg.port} (${used.family})`);
-    console.log('  浏览器里请使用上面打印的 conv/token（不要用旧日志里的 token）。');
   } else {
-    console.log('  请先确保容器内 server.lua 已创建房间，再复检。');
+    console.log('  容器内网关没起来：这就是网页“读取 token 失败：网关未启动？”的直接原因。');
+    console.log(`  先执行: docker exec ${container} ${cfg.gatewayDir}/start_container.sh`);
+    if (!win.ok) {
+      console.log('  另外 Windows 宿主机没有 UDP 10500 代理，本机 8081 网关这条路径也不可用。');
+      console.log(`  可 docker restart ${container} 后重新执行上面的 start_container.sh。`);
+    } else if (count > 1) {
+      console.log('  容器里还有多个 server.lua，先清理到只剩一个：');
+      console.log(`  docker exec ${container} sh -lc "pkill -f '[l]ua server.lua'"`);
+    } else if (link) {
+      console.log(`  宿主机 UDP 链路本身是通的（${used.host}:${cfg.port}），起完容器网关即可直接点②。`);
+    }
   }
   console.log('');
 }
