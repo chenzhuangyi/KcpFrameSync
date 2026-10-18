@@ -1,5 +1,11 @@
 # KCP 帧同步库 — kfsserverlib / kfsclientlib（服务器 + 客户端两个 .so）
 
+<img width="1920" height="914" alt="image" src="https://github.com/user-attachments/assets/a017a962-7d41-4c5b-83b8-45a4003d1607" />
+<img width="1920" height="915" alt="image" src="https://github.com/user-attachments/assets/e424414b-dcf8-4322-b17e-24e8e412b3de" />
+<img width="1920" height="913" alt="image" src="https://github.com/user-attachments/assets/c1d8f734-2cc2-4b41-b7b4-eadfb96f68f9" />
+<img width="1915" height="888" alt="image" src="https://github.com/user-attachments/assets/16b272ca-f47a-4927-a3a5-3ff9c578a98a" />
+
+
 把 KCP 帧同步封装成 Lua 层可直接 `require` 的两个 C 共享库：
 
 - **服务器库** `kfsserverlib.so`：由 C 库驱动所有房间，处理客户端协议包，**收集后转发给同房间内所有客户端**。
