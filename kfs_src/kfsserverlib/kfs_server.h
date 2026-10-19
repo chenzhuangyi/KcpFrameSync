@@ -23,6 +23,7 @@
 #include "frame.h"
 #include "kcp/ikcp.h"
 #include "kfs_common.h"
+#include "log.h"
 
 #include <lua.h>
 #include <lauxlib.h>

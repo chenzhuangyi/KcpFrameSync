@@ -49,7 +49,8 @@ TARGET_CLIENT = $(BUILD_DIR)/kfsclientlib.so
 OBJS_COMMON = $(BUILD_DIR)/kcp/ikcp.o \
               $(BUILD_DIR)/net.o \
               $(BUILD_DIR)/frame.o \
-              $(BUILD_DIR)/kfs_util.o
+              $(BUILD_DIR)/kfs_util.o\
+              $(BUILD_DIR)/log.o
 OBJS_SERVER = $(OBJS_COMMON) \
               $(BUILD_DIR)/kfsserverlib/kfs_core.o \
               $(BUILD_DIR)/kfsserverlib/kfs_lua.o
@@ -81,6 +82,10 @@ $(BUILD_DIR)/frame.o: common/frame.c common/frame.h
 $(BUILD_DIR)/kfs_util.o: common/kfs_util.c common/kfs_common.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c -o $@ common/kfs_util.c
+
+$(BUILD_DIR)/log.o: common/log.c common/log.h
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c -o $@ common/log.c
 
 $(BUILD_DIR)/kfsserverlib/kfs_core.o: kfsserverlib/kfs_core.c kfsserverlib/kfs_server.h
 	@mkdir -p $(dir $@)
@@ -133,12 +138,12 @@ zig:
 	$(ZIG) cc -target $(ZIG_TARGET) -O2 -fPIC -fvisibility=hidden \
 		$(LUA_INC) -Icommon -Ithird \
 		-shared -o $(TARGET_SERVER) \
-		third/kcp/ikcp.c common/net.c common/frame.c common/kfs_util.c \
+		third/kcp/ikcp.c common/net.c common/frame.c common/kfs_util.c common/log.c \
 		kfsserverlib/kfs_core.c kfsserverlib/kfs_lua.c -lpthread
 	$(ZIG) cc -target $(ZIG_TARGET) -O2 -fPIC -fvisibility=hidden \
 		$(LUA_INC) -Icommon -Ithird \
 		-shared -o $(TARGET_CLIENT) \
-		third/kcp/ikcp.c common/net.c common/frame.c common/kfs_util.c \
+		third/kcp/ikcp.c common/net.c common/frame.c common/kfs_util.c common/log.c \
 		kfsclientlib/kfs_client_core.c kfsclientlib/kfs_client_lua.c -lpthread
 
 clean:

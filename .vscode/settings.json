@@ -1,5 +1,6 @@
 {
     "files.associations": {
-        "kfs_client.h": "c"
+        "kfs_client.h": "c",
+        "kfs_server.h": "c"
     }
 }
