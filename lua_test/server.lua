@@ -59,7 +59,7 @@ LOG_DEBUGF(string.format("配置: udp=%s 房间=%d 最大玩家=%d 超时=%dms �
 -----------------------------------------------------------------------
 -- 绑定 UDP 端口，创建多玩家房间
 -----------------------------------------------------------------------
-local conn, err = kfsserverlib.new(udp_port, frame_rate)
+local conn, err = kfsserverlib.init(udp_port, frame_rate)
 if not conn then
     LOG_DEBUGF("绑定端口失败: " .. tostring(err))
     os.exit(1)

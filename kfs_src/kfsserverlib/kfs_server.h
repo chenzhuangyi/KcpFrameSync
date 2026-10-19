@@ -197,7 +197,8 @@ typedef struct {
 // 跨模块函数声明（kfs_core.c 实现；kfs_lua.c 调用）
 //---------------------------------------------------------------------
 // 网络句柄 / 路由
-extern kfs_netref *netref_open(int port, uint32_t frame_interval_ms);
+extern kfs_netref *netref_init(int port, uint32_t frame_interval_ms);
+extern kfs_netref *netref_get(void);
 extern kfs_netref *netref_addref(kfs_netref *r);
 extern void netref_close(kfs_netref *r);
 extern void netref_release(kfs_netref *r);
@@ -222,7 +223,7 @@ extern int  kfs_srv_remove_player_c(kfs_netref *r, kfs_room *room, uint32_t conv
 extern int  kfs_srv_set_player_token_c(kfs_room *room, uint32_t conv, uint32_t token);
 extern void kfs_srv_close_room_c(kfs_netref *r, kfs_room *room);
 
-// 驱动线程入口（netref_open 启动）
+// 驱动线程入口（netref_init 启动）
 extern void *kfs_drive_thread(void *arg);
 
 #endif /* KFS_SERVER_H */

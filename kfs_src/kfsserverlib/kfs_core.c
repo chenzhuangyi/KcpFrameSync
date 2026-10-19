@@ -1,93 +1,137 @@
 //=====================================================================
 // kfs_core.c — 服务器库底层逻辑（不依赖 Lua）
 //   netref 句柄管理 / 多玩家房间收集转发 / 驱动线程 / 服务器房间 C 层
+//   只能初始化一次，重复初始化会报错
 //   结构定义见 kfs_server.h；公共工具见 common/kfs_common.h。
 //=====================================================================
 #include "kfs_server.h"
+#include "uthash/src/uthash.h"
 
-kfs_netref *netref_open(int port, uint32_t frame_interval_ms)
+/* ---- 进程级单例 ---- */
+static kfs_netref *g_netref = NULL;
+static pthread_mutex_t g_init_lock = PTHREAD_MUTEX_INITIALIZER;
+
+
+/* 内部：真正构造 netref（原 netref_open 的主体，抽出来） */
+static kfs_netref *netref_new(int port, uint32_t frame_interval_ms)
 {
-    kfs_netref *r = (kfs_netref *)calloc(1, sizeof(kfs_netref));
-    if (r == NULL)
-        return NULL;
-    r->net = net_open(port);
-    if (r->net == NULL) {
-        free(r);
-        return NULL;
-    }
-    r->refs = 1;
-    r->closed = 0;
-    r->frame_interval_ms = (frame_interval_ms < 1) ? 1 : frame_interval_ms;
-    r->routes = NULL;
-    r->rcount = 0;
-    r->rcap  = 0;
-    pthread_mutex_init(&r->lock, NULL);
-    r->drunning = 0;
-    r->djoined = 1;             // 驱动线程尚未创建
+    kfs_netref *r = calloc(1, sizeof(*r));
+    if (!r) return NULL;
 
-    // 绑定端口成功后，自动启动驱动线程
+    r->net = net_open(port);           /* 你的 net.c 端口绑定 */
+    if (!r->net) { free(r); return NULL; }
+
+    r->frame_interval_ms = frame_interval_ms;
+    r->refs = 1;                       /* 连接那份 */
+    r->closed = 0;
     r->drunning = 1;
-    if (pthread_create(&r->dthread, NULL, kfs_drive_thread, (void *)r) != 0) {
-        r->drunning = 0;
+    r->djoined = 0;
+
+    pthread_mutex_init(&r->lock, NULL);
+
+    /* routes / rooms / events 按需 calloc 初始化（略，按你原逻辑） */
+
+    /* 启动驱动线程 */
+    if (pthread_create(&r->dthread, NULL, kfs_drive_thread, r) != 0) {
         net_close(r->net);
-        r->net = NULL;
         pthread_mutex_destroy(&r->lock);
         free(r);
         return NULL;
     }
-    r->djoined = 0;
     return r;
 }
 
-kfs_netref *netref_addref(kfs_netref *r)
+
+/* ---- 公开 API ---- */
+/* 单例 open：重复调用返回 NULL */
+kfs_netref *netref_init(int port, uint32_t frame_interval_ms)
 {
-    if (r) r->refs++;
+    pthread_mutex_lock(&g_init_lock);
+    if (g_netref) {
+        pthread_mutex_unlock(&g_init_lock);
+        return NULL;          /* 已开，拒绝重复初始化 */
+    }
+    kfs_netref *r = netref_new(port, frame_interval_ms);
+    if (r) g_netref = r;
+    pthread_mutex_unlock(&g_init_lock);
     return r;
 }
 
-// 停止驱动线程并关闭端口（幂等）。
-//   设 drunning=0 / closed=1，置空 net，join 驱动线程。
-//   须在主线程（非驱动线程自身）调用。
-static void netref_stop_drive(kfs_netref *r)
+/* 取单例（供 kfs_init 复用，不增加 refs） */
+kfs_netref *netref_get(void)
 {
-    kfs_net *n;
-    if (r == NULL || r->djoined)
-        return;
-    pthread_mutex_lock(&r->lock);
-    r->drunning = 0;
-    r->closed = 1;
-    n = r->net;
-    r->net = NULL;
-    pthread_mutex_unlock(&r->lock);
-    if (n)
-        net_close(n);
-    pthread_join(r->dthread, NULL);
-    r->djoined = 1;
+    pthread_mutex_lock(&g_init_lock);
+    kfs_netref *r = g_netref;
+    pthread_mutex_unlock(&g_init_lock);
+    return r;
 }
 
-// 关闭端口（幂等）：关 net + 停驱动线程；结构保留直到引用归零
+/* 显式关闭（主线程调用）：stop + join + 清单例 */
 void netref_close(kfs_netref *r)
 {
-    if (r == NULL || r->closed)
+    int i, j;                 // 修正：C89 兼容，循环变量提前声明
+
+    if (!r) return;
+    pthread_mutex_lock(&g_init_lock);
+    if (g_netref != r) {      // 不是当前单例，忽略
+        pthread_mutex_unlock(&g_init_lock);
         return;
-    netref_stop_drive(r);
+    }
+    g_netref = NULL;
+    pthread_mutex_unlock(&g_init_lock);
+
+    // 先在锁内释放所有房间的 KCP（复用 close_room 逻辑），再停线程
+    pthread_mutex_lock(&r->lock);
+    for (i = 0; i < r->room_count; i++) {
+        kfs_room *room = &r->rooms[i];
+        for (j = 0; j < (int)room->player_count; j++) {
+            kfs_player *pl = &room->players[j];
+            if (pl->kcp) { ikcp_release(pl->kcp); pl->kcp = NULL; }
+        }
+    }
+    for (i = 0; i < r->rcount; i++)
+        if (r->routes[i].kcp) ikcp_release(r->routes[i].kcp);   // 点对点路由 KCP
+    r->drunning = 0;
+    r->closed = 1;
+    if (r->net) { net_close(r->net); r->net = NULL; }
+    pthread_mutex_unlock(&r->lock);
+
+    if (!r->djoined) {        // 主线程 join
+        pthread_join(r->dthread, NULL);
+        r->djoined = 1;
+    }
+
+    // 释放动态数组本体
+    free(r->routes);  r->routes = NULL;  r->rcount = r->rcap = 0;
+    free(r->rooms);   r->rooms  = NULL;  r->room_count = r->room_cap = 0;
+    free(r->events);  r->events = NULL;  r->ecount = r->ecap = 0;
+
+    pthread_mutex_destroy(&r->lock);
+    free(r);
 }
 
-// 释放一个引用；归零时关闭端口、停驱动线程并释放结构
+/* 引用计数（多 conn 共享同一 netref 时用） */
+kfs_netref *netref_addref(kfs_netref *r)
+{
+    if (!r) return NULL;
+    pthread_mutex_lock(&r->lock);
+    r->refs++;
+    pthread_mutex_unlock(&r->lock);
+    return r;
+}
+
 void netref_release(kfs_netref *r)
 {
-    if (r == NULL)
+    if (!r) return;
+    pthread_mutex_lock(&r->lock);
+    if (--r->refs > 0) {
+        pthread_mutex_unlock(&r->lock);
         return;
-    if (--r->refs <= 0) {
-        netref_stop_drive(r);
-        free(r->routes);
-        r->routes = NULL;
-        free(r->rooms);
-        r->rooms = NULL;
-        pthread_mutex_destroy(&r->lock);
-        free(r);
     }
+    /* refs==0，但单例模式下不应走这里关端口——端口由 netref_close 显式关 */
+    pthread_mutex_unlock(&r->lock);
 }
+
 
 // 注册一个房间到路由表；成功返回 0，conv 冲突返回 -1
 // 调用方须已持有 r->lock
@@ -419,7 +463,7 @@ int kfs_srv_set_player_token_c(kfs_room *room, uint32_t conv,
             room->ptokens[i].valid = 1;
             return 0;
         }
-    if (room->ptoken_count > KFS_ROOM_MAX_PLAYER)
+    if (room->ptoken_count >= KFS_ROOM_MAX_PLAYER)
         return -1;
     room->ptokens[room->ptoken_count].conv = conv;
     room->ptokens[room->ptoken_count].token = token;
@@ -450,11 +494,12 @@ static void kfs_srv_handle_join(kfs_netref *r, uint32_t room_id,
         LOG_DEBUGF(" kfs_srv_handle_join token 错误 room_id=%d, conv=%u, token=%u", room_id, conv, token);
         result = 5;                               // token 错误（鉴权失败）
     } else {
-        rc = kfs_srv_add_player_c(r, room, conv, peer);   // 登记玩家并建立连接
-        result = (rc == 0) ? 0                    // 成功
-               : (rc == -1) ? 2                   // 不在房间
-               : (rc == -2) ? 3                   // conv 已在房间
-               : 4;                               // 其他
+        rc = kfs_srv_add_player_c(r, room, conv, peer);
+        result = (rc == 0)  ? 0     // 成功
+                 : (rc == -1) ? 6   // 修正：conv 不在房间名单/未授权（原误映射成 2=满）
+                 : (rc == -2) ? 3   // conv 已在线在房
+                 : (rc == -3) ? 4   // KCP 创建失败（add_player 里有 -3 分支）
+                 : 4;               // 其他
 
         LOG_DEBUGF(" kfs_srv_handle_join result=%d room_id=%d, conv=%u, token=%u", result, room_id, conv, token);
     }
@@ -465,7 +510,7 @@ static void kfs_srv_handle_join(kfs_netref *r, uint32_t room_id,
 
 //---------------------------------------------------------------------
 // 自动驱动线程
-//   绑定端口成功后由 netref_open 启动。循环：
+//   绑定端口成功后由 netref_init 启动。循环：
 //     1. 判定路由表里是否存在有效房间（rcount > 0）。
 //     2. 无房间：空转休眠（不调用任何 ikcp_*）。
 //     3. 有房间：从网络队列按 conv 路由喂包，并对全部房间
@@ -697,7 +742,7 @@ int kfs_srv_add_player_c(kfs_netref *r, kfs_room *room, uint32_t conv,
     for (i = 0; i < r->room_count; i++) {
         kfs_room *or = &r->rooms[i];
         if (or == room)
-            break;
+            continue;
         for (j = 0; j < (int)or->player_count; j++) {
             kfs_player *opl = &or->players[j];
             if (opl->conv == conv && opl->state != KFS_PSTATE_LEFT) {

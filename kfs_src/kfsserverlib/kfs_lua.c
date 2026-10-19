@@ -5,6 +5,9 @@
 //=====================================================================
 #include "kfs_server.h"
 
+/* 可选：registry 钉住唯一 conn，防 GC 误关 */
+static int g_conn_ref = LUA_NOREF;
+
 //=====================================================================
 // 内部小工具
 //=====================================================================
@@ -74,25 +77,33 @@ static int kfs_srv_gc(lua_State *L);
 
 //=====================================================================
 // 工厂：fs.new(port)  → 返回连接实例（只绑定端口，未创建房间）
-//  绑定端口成功后，自动启动驱动线程（见 netref_open）。
+//  绑定端口成功后，自动启动驱动线程（见 netref_init）。
 //=====================================================================
-static int kfs_new(lua_State *L)
+static int kfs_init(lua_State *L)
 {
-    LOG_DEBUGF("Hello, world! %d", 123);
+    // 已初始化：把已钉住的 conn 压回栈复用（幂等，仍是单例）
+    if (g_conn_ref != LUA_NOREF) {
+        lua_rawgeti(L, LUA_REGISTRYINDEX, g_conn_ref);
+        return 1;
+    }
+
     lua_Integer port = luaL_checkinteger(L, 1);
     lua_Integer fps  = luaL_optinteger(L, 2, 20);   // frame_rate，默认 20
-    uint32_t interval;
-    kfs_conn_t *self = (kfs_conn_t *)lua_newuserdatauv(L, sizeof(kfs_conn_t), 0);
-
     if (fps < 1) fps = 1;
-    interval = (uint32_t)(1000 / fps);
+    if (fps > 60) fps = 60;
+    uint32_t interval = (uint32_t)(1000 / fps);
     if (interval < 1) interval = 1;
-    self->r = netref_open((int)port, interval);
-    if (self->r == NULL) {
+
+    kfs_netref *r = netref_init(port, interval);  // 单例，端口占用/重复返回 NULL
+    if (r == NULL) {
         lua_pushnil(L);
         lua_pushstring(L, net_errmsg(NULL));
         return 2;
     }
+
+    // 1) 先建元表并挂到 self 上，确保 self 回到栈顶后再 ref
+    kfs_conn_t *self = (kfs_conn_t *)lua_newuserdatauv(L, sizeof(kfs_conn_t), 0);
+    self->r = r;   // 走"钉住 + GC 哑火"路线：不 addref，共享 netref_init 的 refs=1
 
     if (luaL_newmetatable(L, "kfsserverlib")) {
         static const luaL_Reg methods[] = {
@@ -113,8 +124,25 @@ static int kfs_new(lua_State *L)
         lua_pushliteral(L, "kfsserverlib");
         lua_rawset(L, -3);
     }
-    lua_setmetatable(L, -2);
+    lua_setmetatable(L, -2);   // 此刻栈：[..., self(带元表)]，self 是栈顶
+
+    // 2) self 在栈顶，ref 弹的才是 self —— 钉住的是 conn，不是元表
+    g_conn_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    lua_rawgeti(L, LUA_REGISTRYINDEX, g_conn_ref);  // 推回 self 作为返回值
     return 1;
+}
+
+// kfs_shutdown()：显式关端口（主线程调用）
+static int l_kfs_shutdown(lua_State *L) {
+    if (g_conn_ref == LUA_NOREF) return 0;
+    lua_rawgeti(L, LUA_REGISTRYINDEX, g_conn_ref);
+    kfs_conn_t *c = (kfs_conn_t *)lua_touserdata(L, -1);  // 修正：标准 API
+    if (c && c->r)
+        netref_close(c->r);          // 主线程：stop + join + 清 g_netref
+    luaL_unref(L, LUA_REGISTRYINDEX, g_conn_ref);
+    g_conn_ref = LUA_NOREF;
+    lua_pop(L, 1);
+    return 0;
 }
 
 //=====================================================================
@@ -288,14 +316,10 @@ static int kfs_conn_close(lua_State *L)
     return 0;
 }
 
-// __gc：释放引用（不强制关闭端口；netref_release 归零时才释放）
+// __gc：钉住路线下空实现——端口生死只由 netref_close（shutdown / conn:close）决定
 static int kfs_conn_gc(lua_State *L)
 {
-    kfs_conn_t *conn = check_conn(L, 1);
-    if (conn->r) {
-        netref_release(conn->r);
-        conn->r = NULL;
-    }
+    (void)L;
     return 0;
 }
 
@@ -1053,7 +1077,8 @@ static int kfs_srv_gc(lua_State *L)
 // 模块入口
 //=====================================================================
 static const luaL_Reg kfs_module[] = {
-    { "new",    kfs_new },
+    { "init",    kfs_init },
+    { "shutdown",    l_kfs_shutdown },
     { NULL, NULL }
 };
 
