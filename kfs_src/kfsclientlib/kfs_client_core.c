@@ -35,9 +35,26 @@ void *kfs_drive_thread(void *arg)
             if (rcv >= 5) {
                 memcpy(&m, buf, 4);
                 if (m == KFS_HANDSHAKE_MAGIC) {
-                    c->joined = 1;                  // 裸握手应答
+                    c->joined  = 1;                 // 裸握手应答
                     c->join_ok = (buf[4] == 0);
-                    continue;
+                    // 成功JOIN应答：[magic4][result1][frame_interval_ms4][room_seed4][server_time_ms8]=21B
+                    if (rcv >= 21) {
+                        uint32_t fi   = 0;
+                        uint32_t seed = 0;
+                        uint64_t stime = 0;
+                        memcpy(&fi,    buf + 5,  4);   // frame_interval_ms
+                        memcpy(&seed,  buf + 9,  4);   // room_seed（与服务器 room->room_seed 同宽4B）
+                        memcpy(&stime, buf + 13, 8);   // server_time_ms
+
+                        c->fi = fi;
+                        c->seed = seed;    // 存下，本地 RNG 用它回滚重算
+                        // 记录 客户端↔服务器 时钟差：客户端本地时刻 = server_time + offset
+                        c->stime = (int64_t)(kfs_now_ms() - stime);
+
+                        LOG_DEBUGF("JOIN_ACK ok=%d fi=%u seed=%u stime=%llu",
+                            (int)c->join_ok, fi, seed, (unsigned long long)stime);
+                    }
+                    continue;                         // 握手包已消费，不喂 KCP
                 }
             }
             if (c->kcp)

@@ -158,8 +158,8 @@ static int kfs_join(lua_State *L)
         return 2;
     }
 
-    // 等待服务器应答（驱动线程异步更新 joined/join_ok），超时 2s
-    deadline = kfs_now_ms() + 2000;
+    // 等待服务器应答（驱动线程异步更新 joined/join_ok），超时 5s
+    deadline = kfs_now_ms() + 5000;
     while (kfs_now_ms() < deadline) {
         pthread_mutex_lock(&c->lock);
         if (c->joined) {
@@ -283,7 +283,12 @@ static int kfs_recv_broadcast(lua_State *L)
         free(pkt);
         return luaL_error(L, "error kfs_client_lua: bad frame payload");
     }
-    if (type != KFS_CMD_BROADCAST) {
+    if (type == KFS_CMD_ALL_READY){
+        // 处理全部准备完成
+
+        free(pkt);
+        return 0;
+    }else if (type != KFS_CMD_BROADCAST) {
         free(pkt);                 // 非广播帧：丢弃
         return 0;
     }

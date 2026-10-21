@@ -35,25 +35,14 @@ extern "C" {
 // 单帧总长上限（帧头 + 最大负载；两种帧头取较大者）
 #define KFS_FRAME_MAX_TOTAL (KFS_FRAME2_HEADER_SIZE + KFS_FRAME_MAX_DATA)
 
-//---------------------------------------------------------------------
-// 帧消息类型（协议在 KCP 可靠字节流之上，单条 KCP 消息承载一帧）
-//---------------------------------------------------------------------
-typedef enum {
-    KFS_CMD_INPUT      = 1,   // 客户端 → 服务器：上报一帧输入
-    KFS_CMD_BROADCAST  = 2,   // 服务器 → 客户端：广播整帧（含全员输入）
-    KFS_CMD_JOIN       = 3,   // 客户端 → 服务器：请求加入房间
-    KFS_CMD_LEAVE      = 4,   // 客户端 → 服务器：离开房间
-    KFS_CMD_HEARTBEAT  = 5,   // 心跳（保活 / 掉线判定）
-    KFS_CMD_STATE      = 6,   // 客户端 → 服务器：上报某帧逻辑状态哈希（对账）
-    KFS_CMD_READY      = 7,   // 客户端 → 服务器：游戏数据加载完毕，上报就绪
-} kfs_cmd;
+
 
 //---------------------------------------------------------------------
 // 裸 UDP 握手协议（KCP 会话建立前，客户端 → 服务器学习地址并登记）
 //   JOIN 请求（带会话 token，鉴权）：
 //     [ magic 4B ][ room_id 4B ][ conv 4B ][ token 4B ]   (16 字节)
 //     兼容旧格式：无 token（12 字节）按 token=0 处理。
-//   JOIN 应答：[ magic 4B ][ result 1B ]                (5 字节)
+//   JOIN 应答：[ magic 4B ][ result 1B ][frame_interval_ms 4B][room_seed 4B][server_time_ms 8B]    (21 字节)
 //     result: 0=成功  1=房间不存在  2=房间满  3=conv冲突
 //             4=其他  5=token 错误
 //   服务器据此从请求包源地址学到客户端的真实 ip:port 并登记进房间，
@@ -62,6 +51,32 @@ typedef enum {
 #define KFS_HANDSHAKE_MAGIC 0x4B464346u   // "KFCF"，与 KCP 内部 cmd 值不冲突
 #define KFS_HS_LEN          12            // 旧 JOIN 请求包长度（无 token）
 #define KFS_HS_LEN2         16            // 新 JOIN 请求包长度（带 token）
+
+//---------------------------------------------------------------------
+// 帧消息类型（协议在 KCP 可靠字节流之上，单条 KCP 消息承载一帧）
+//---------------------------------------------------------------------
+typedef enum {
+    KFS_CMD_INPUT      = 1,   // 客户端 → 服务器：上报一帧输入
+    KFS_CMD_BROADCAST  = 2,   // 服务器 → 客户端：广播整帧（含全员输入）
+    KFS_CMD_JOIN       = 3,   // 客户端 → 服务器：请求加入房间(KFS_HANDSHAKE_MAGIC)
+    KFS_CMD_LEAVE      = 4,   // 客户端 → 服务器：离开房间
+    KFS_CMD_HEARTBEAT  = 5,   // 心跳（保活 / 掉线判定）
+    KFS_CMD_STATE      = 6,   // 客户端 → 服务器：上报某帧逻辑状态哈希（对账）
+    KFS_CMD_READY      = 7,   // 客户端 → 服务器：游戏数据加载完毕，上报就绪
+    KFS_CMD_READY_ACK  = 8,   // 服务器 → 客户端：加载和连接就绪回复（1）
+    KFS_CMD_ALL_READY  = 9,   // 服务器 → 客户端：全部客户端加载和连接就绪回复（[server_time_ms 8B]）
+    KFS_CMD_REJOIN_SYNC =10,
+    KFS_CMD_PLAYER_REJOIN =11,
+} kfs_cmd;
+/* JOIN_RES payload结构：
+ * uint32 frame_interval_ms
+ * uint32 room_seed
+ * uint64 server_time_ms
+ * uint32 sync_fid        // 新增：最近一致锚点帧
+ * uint32 collecting_fid   // 新增：当前房间正在收集的帧
+ */
+
+
 
 //---------------------------------------------------------------------
 // 打包一帧。成功返回总字节数（>= KFS_FRAME_HEADER_SIZE）；失败返回 -1。

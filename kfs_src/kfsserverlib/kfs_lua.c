@@ -848,28 +848,28 @@ static int kfs_conn_new_room(lua_State *L)
 //   返回 0 成功；-1 房间满；-2 conv 已在线在房；-3 KCP 创建失败；-4 房间已关闭
 static int kfs_srv_add_player(lua_State *L)
 {
-    kfs_srvroom_t *srv = check_srvroom(L, 1);
-    lua_Integer conv = luaL_checkinteger(L, 2);
-    const char *ip  = luaL_checkstring(L, 3);
-    lua_Integer port = luaL_checkinteger(L, 4);
-    kfs_netref *r = srv->r;
-    struct sockaddr_in peer;
-    kfs_room *room;
-    int rc;
+    // kfs_srvroom_t *srv = check_srvroom(L, 1);
+    // lua_Integer conv = luaL_checkinteger(L, 2);
+    // const char *ip  = luaL_checkstring(L, 3);
+    // lua_Integer port = luaL_checkinteger(L, 4);
+    // kfs_netref *r = srv->r;
+    // struct sockaddr_in peer;
+    // kfs_room *room;
+    // int rc;
 
-    memset(&peer, 0, sizeof(peer));
-    peer.sin_family = AF_INET;
-    peer.sin_port = htons((uint16_t)port);
-    if (inet_pton(AF_INET, ip, &peer.sin_addr) != 1)
-        return luaL_error(L, "error kfs_lua: invalid ip '%s'", ip);
-    if (r == NULL || srv->closed)
-        return luaL_error(L, "error kfs_lua: room gone");
-    pthread_mutex_lock(&r->lock);
-    room = kfs_room_find(r, srv->room_id);
-    rc = room ? kfs_srv_add_player_c(r, room, (uint32_t)(conv & 0xFFFFFFFFu),
-                                     &peer) : -4;
-    pthread_mutex_unlock(&r->lock);
-    lua_pushinteger(L, rc);
+    // memset(&peer, 0, sizeof(peer));
+    // peer.sin_family = AF_INET;
+    // peer.sin_port = htons((uint16_t)port);
+    // if (inet_pton(AF_INET, ip, &peer.sin_addr) != 1)
+    //     return luaL_error(L, "error kfs_lua: invalid ip '%s'", ip);
+    // if (r == NULL || srv->closed)
+    //     return luaL_error(L, "error kfs_lua: room gone");
+    // pthread_mutex_lock(&r->lock);
+    // room = kfs_room_find(r, srv->room_id);
+    // rc = room ? kfs_srv_add_player_c(r, room, (uint32_t)(conv & 0xFFFFFFFFu),
+    //                                  &peer) : -4;
+    // pthread_mutex_unlock(&r->lock);
+    // lua_pushinteger(L, rc);
     return 1;
 }
 
@@ -960,13 +960,16 @@ static int kfs_srv_start(lua_State *L)
     pthread_mutex_lock(&r->lock);
     room = kfs_room_find(r, srv->room_id);
     if (room) {
-        room->phase = 1;                        // 进入对局：开始收集推帧
-        room->collecting_fid = 0;
-        room->recv_mask = 0;
-        memset(room->input_len, 0, sizeof(room->input_len));
-        room->collect_begin_ms = kfs_now_ms();
-        room->tick_done = 0;
-        rc = 0;
+        if (room->phase == 0)
+        {
+            room->phase = 1;                        // 进入对局：开始收集推帧
+            room->collecting_fid = 0;
+            room->recv_mask = 0;
+            memset(room->input_len, 0, sizeof(room->input_len));
+            room->collect_begin_ms = kfs_now_ms();
+            room->tick_done = 0;
+            rc = 0;
+        }
     }
     pthread_mutex_unlock(&r->lock);
     lua_pushinteger(L, rc);

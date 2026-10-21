@@ -21,6 +21,8 @@
 #include "frame.h"
 #include "kcp/ikcp.h"
 #include "kfs_common.h"
+#include "log.h"
+#include "kfs_code.h"
 
 #include <lua.h>
 #include <lauxlib.h>
@@ -51,6 +53,9 @@ typedef struct kfs_client {
 
     int         heartbeat_ms;   // 自动心跳间隔（0=不启用）；驱动线程按此补发 HEARTBEAT
     uint64_t    last_heartbeat_ms;  // 上次发心跳的时间（单调时钟 ms）
+    uint32_t fi;                // 同步间隔ms
+    uint32_t seed;              // 随机因子
+    uint64_t stime;             // 服务器时间ms
 } kfs_client;
 
 //---------------------------------------------------------------------

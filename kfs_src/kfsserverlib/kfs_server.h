@@ -24,6 +24,7 @@
 #include "kcp/ikcp.h"
 #include "kfs_common.h"
 #include "log.h"
+#include "kfs_code.h"
 
 #include <lua.h>
 #include <lauxlib.h>
@@ -32,8 +33,9 @@
 //---------------------------------------------------------------------
 // 常量
 //---------------------------------------------------------------------
-// 房间最大玩家数与单帧单玩家输入上限（原型定长，可改动态）
-#define KFS_ROOM_MAX_PLAYER 8
+// 房间最大玩家数
+#define KFS_ROOM_MAX_PLAYER 32
+// 单帧单玩家输入上限（原型定长，可改动态）
 #define KFS_ROOM_INPUT_MAX  512
 
 // 超前输入窗口：玩家 KCP 里可能同时缓存未来多帧输入，用环形缓冲暂存，
@@ -71,9 +73,10 @@ typedef struct kfs_send_ctx {
 // 玩家状态（kfs_player.state）：成员列表 players[] 单一数组，
 // 由 state 区分三类占位；ready / offline 为附属标志。
 typedef enum {
-    KFS_PSTATE_INIT   = 0,   // 初始登记：创建房间时预登记（未连接），等待客户端 JOIN
-    KFS_PSTATE_ONLINE = 1,   // 已 JOIN 在线（参与收集/广播；ready/offline 附属）
-    KFS_PSTATE_LEFT   = 2,   // 已转房/离开：席位保留，不参与收集与广播
+    KFS_PSTATE_INIT         = 0,   // 初始登记：创建房间时预登记（未连接），等待客户端 JOIN
+    KFS_PSTATE_ONLINE       = 1,   // 已 JOIN 在线（参与收集/广播；ready/offline 附属）
+    KFS_PSTATE_LEFT         = 2,   // 已转房/离开：席位不保留，不参与收集与广播
+    KFS_PSTATE_DISCONNECT   = 3,   // 已掉线：席位保留，不参与收集与广播（预留）
 } kfs_pstate;
 
 // 玩家"在线"（有连接，驱动 update/收包/广播）
@@ -127,6 +130,7 @@ typedef struct kfs_room {
     uint32_t sync_fid;          // 最近一致点（所有玩家状态一致的最高帧）
     int      sync_valid;        // 是否已有一致点
     int      desync;            // 1=检测到不同步（状态哈希不一致）
+    uint32_t room_seed;         // 随机因子
 } kfs_room;
 
 // 点对点房间路由项（旧 create_room 兼容保留）
@@ -217,7 +221,7 @@ extern int  kfs_srv_new_room_c(kfs_netref *r, uint32_t room_id,
                                uint64_t timeout_ms, uint32_t token,
                                uint64_t ttl_ms, uint64_t idle_timeout_ms,
                                const uint32_t *init_convs, int init_count);
-extern int  kfs_srv_add_player_c(kfs_netref *r, kfs_room *room, uint32_t conv,
+extern int  kfs_srv_add_player_c(kfs_netref *r, kfs_room *room, uint32_t conv, uint32_t token,
                                  const struct sockaddr_in *peer);
 extern int  kfs_srv_remove_player_c(kfs_netref *r, kfs_room *room, uint32_t conv);
 extern int  kfs_srv_set_player_token_c(kfs_room *room, uint32_t conv, uint32_t token);

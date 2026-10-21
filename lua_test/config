@@ -16,7 +16,7 @@ ttl_ms = 0
 # （席位保留、可重连，不自动删除成员；业务层可调 remove_player 主动清理）。
 # 准备阶段（等全员就绪、房间未 start、尚无帧包）玩家连接全靠心跳保活，
 # 该值须配合 heartbeat_ms 设置：如心跳 500ms、阈值 2000ms（连丢 4 个心跳判掉线）。
-idle_timeout_ms = 2000
+idle_timeout_ms = 5000
 
 # 帧率（每秒帧数）
 frame_rate = 20

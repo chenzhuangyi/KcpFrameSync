@@ -296,7 +296,7 @@ class Session {
           hint =
             `2s 内没有收到任何 UDP 回包：${target}/udp (${this.udpFamily || cfg.serverFamily}) 不可达。\n` +
             `      先确认 server.lua 在跑（容器内: pgrep -af 'lua server.lua'），且它监听的 udp_port 与网关目标端口一致。\n` +
-            (cfg.serverPort === 10501
+            (cfg.serverPort === 10500
               ? `      当前目标是 10501：这是 bridge_windows.js 的 UDP 口，必须同时有 bridge_container.js 在容器内运行；\n` +
                 `      直连 Docker 服务器请把 KFS_SERVER_PORT 改回 10500（或看 lua_test/config 的 udp_port）。\n`
               : `      网关在容器内时目标应是 127.0.0.1:${cfg.serverPort}；网关在 Windows 时先查 Docker 的 UDP 代理：\n` +

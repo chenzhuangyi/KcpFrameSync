@@ -175,11 +175,15 @@ local start_time = os.clock() * 1000
 
 -- 把输入补发到 next_fid + advance_frames（全员一起发，帧号一致）
 local function topup()
-    local target = next_fid + advance_frames
-    while send_fid < target do
+    local target_max = next_fid + advance_frames
+    -- LOG_DEBUGF("send_fid=%d, target_max=%d", send_fid, target_max)
+    while send_fid < target_max do
         send_fid = send_fid + 1
+        -- LOG_DEBUGF("send_fid=%d, target_max=%d", send_fid, target_max)
         if send_fid >= 0 then
+            -- LOG_DEBUGF("send_fid=%d, target_max=%d, #clients=%d", send_fid, target_max, #clients)
             for i = 1, #clients do
+                LOG_DEBUGF("conv=%d, send_fid=%d, target_max=%d, #clients=%d", convs[i], send_fid, target_max, #clients)
                 clients[i]:send_input(send_fid,
                                       string.format("p%d:f%d", convs[i], send_fid))
             end

@@ -69,18 +69,29 @@ kfs_netref *netref_get(void)
 /* 显式关闭（主线程调用）：stop + join + 清单例 */
 void netref_close(kfs_netref *r)
 {
-    int i, j;                 // 修正：C89 兼容，循环变量提前声明
-
+    int i, j;
     if (!r) return;
-    pthread_mutex_lock(&g_init_lock);
-    if (g_netref != r) {      // 不是当前单例，忽略
-        pthread_mutex_unlock(&g_init_lock);
-        return;
+
+    // 第一步：先锁r自身锁，发停止信号，保证驱动线程能退出
+    pthread_mutex_lock(&r->lock);
+    r->drunning = 0;
+    r->closed = 1;
+    pthread_mutex_unlock(&r->lock);
+
+    // 第二步：等待驱动线程退出（线程退出后，不会再碰r->lock）
+    if (!r->djoined) {
+        pthread_join(r->dthread, NULL);
+        r->djoined = 1;
     }
-    g_netref = NULL;
+
+    // 第三步：现在驱动线程已经退出，不会再访问r资源，再拿全局锁摘除单例
+    pthread_mutex_lock(&g_init_lock);
+    if (g_netref == r) {
+        g_netref = NULL;
+    }
     pthread_mutex_unlock(&g_init_lock);
 
-    // 先在锁内释放所有房间的 KCP（复用 close_room 逻辑），再停线程
+    // 第四步：现在安全持有r，遍历释放所有KCP（此时无线程竞争r里面的房间/kcp）
     pthread_mutex_lock(&r->lock);
     for (i = 0; i < r->room_count; i++) {
         kfs_room *room = &r->rooms[i];
@@ -90,18 +101,11 @@ void netref_close(kfs_netref *r)
         }
     }
     for (i = 0; i < r->rcount; i++)
-        if (r->routes[i].kcp) ikcp_release(r->routes[i].kcp);   // 点对点路由 KCP
-    r->drunning = 0;
-    r->closed = 1;
+        if (r->routes[i].kcp) ikcp_release(r->routes[i].kcp);
     if (r->net) { net_close(r->net); r->net = NULL; }
     pthread_mutex_unlock(&r->lock);
 
-    if (!r->djoined) {        // 主线程 join
-        pthread_join(r->dthread, NULL);
-        r->djoined = 1;
-    }
-
-    // 释放动态数组本体
+    // 第五步：释放动态内存、销毁mutex
     free(r->routes);  r->routes = NULL;  r->rcount = r->rcap = 0;
     free(r->rooms);   r->rooms  = NULL;  r->room_count = r->room_cap = 0;
     free(r->events);  r->events = NULL;  r->ecount = r->ecap = 0;
@@ -124,11 +128,8 @@ void netref_release(kfs_netref *r)
 {
     if (!r) return;
     pthread_mutex_lock(&r->lock);
-    if (--r->refs > 0) {
-        pthread_mutex_unlock(&r->lock);
-        return;
-    }
-    /* refs==0，但单例模式下不应走这里关端口——端口由 netref_close 显式关 */
+    if (r->refs > 0)
+        --r->refs;
     pthread_mutex_unlock(&r->lock);
 }
 
@@ -223,7 +224,9 @@ kfs_room *kfs_room_find(kfs_netref *r, uint32_t room_id)
 // 返回总字节数；失败返回 -1
 static int kfs_room_build_broadcast(kfs_room *room, char *out, int out_cap)
 {
-    char payload[KFS_ROOM_MAX_PLAYER * (4 + 2 + KFS_ROOM_INPUT_MAX) + 4];
+    size_t pay_max = KFS_ROOM_MAX_PLAYER * (4 + 2 + KFS_ROOM_INPUT_MAX) + 4;
+    char *payload = malloc(pay_max);
+    if (!payload) return -1;
     char *p = payload;
     uint32_t h;
     int   i, len;
@@ -231,7 +234,7 @@ static int kfs_room_build_broadcast(kfs_room *room, char *out, int out_cap)
     for (i = 0; i < (int)room->player_count; i++) {
         uint16_t l;
         if (!KFS_PLAYER_ONLINE(&room->players[i]))
-            continue;           // INIT/LEFT 未参与对局：不入广播
+            continue;
         memcpy(p, &room->players[i].conv, 4); p += 4;
         l = (uint16_t)room->input_len[i];
         memcpy(p, &l, 2); p += 2;
@@ -242,14 +245,14 @@ static int kfs_room_build_broadcast(kfs_room *room, char *out, int out_cap)
         }
     }
     len = (int)(p - payload);
-    // 帧对账：对逐玩家序列计算 FNV-1a32 并追加 4B，客户端重算 body 比对，
-    // 不一致即判定该帧不同步。
     h = frame_fnv1a(payload, len);
     memcpy(p, &h, 4);
     p += 4;
     len += 4;
-    return frame_encode2(out, out_cap, KFS_CMD_BROADCAST,
-                         room->collecting_fid, payload, len);
+    int ret = frame_encode2(out, out_cap, KFS_CMD_BROADCAST,
+                            room->collecting_fid, payload, len);
+    free(payload);
+    return ret;
 }
 
 // 每驱动 tick 尝试推进一帧：所有玩家 pend 里都有 collecting_fid 的输入
@@ -263,17 +266,16 @@ static void kfs_room_try_advance(kfs_netref *r, kfs_room *room)
     if (room->player_count == 0 || room->tick_done)
         return;
     fid = room->collecting_fid;
-    // 检查全员（在线且未掉线）pend 是否都有本帧输入。
-    // 掉线玩家（offline=1）不阻塞集齐：广播时用其 input_buf 最近一次输入填充。
+    // 用 recv_mask 位图 O(1) 判集齐：活跃玩家的对应位必须都已置 1。
+    // 掉线玩家（offline=1）不参与判定，广播时用其 input_buf 最近输入填充。
     for (i = 0; i < (int)room->player_count; i++) {
         kfs_player *pl = &room->players[i];
-        kfs_pframe *pf;
         if (!KFS_PLAYER_ACTIVE(pl))
             continue;
-        pf = &pl->pend[fid % KFS_PLAYER_BUF];
-        if (!pf->valid || pf->fid != fid)
+        if (!(room->recv_mask & (1U << pl->slot_index)))
             return;                             // 本帧尚缺该玩家输入，等下个 tick
     }
+    LOG_DEBUGF("kfs_room_try_advance room_id=%d fid=%u", room->room_id, fid);
     // 齐了：把本帧输入写回 input_buf/input_len（供广播构建与超时填充）
     for (i = 0; i < (int)room->player_count; i++) {
         kfs_player *pl = &room->players[i];
@@ -289,10 +291,15 @@ static void kfs_room_try_advance(kfs_netref *r, kfs_room *room)
     if (total < 0)
         return;
     for (i = 0; i < (int)room->player_count; i++)
-        if (KFS_PLAYER_ONLINE(&room->players[i]))
+        if (KFS_PLAYER_ONLINE(&room->players[i])){
+            LOG_DEBUGF("kfs_room_try_advance room_id=%d conv=%d fid=%u", room->room_id, room->players[i].conv, fid);
             ikcp_send(room->players[i].kcp, pkt, total);   // → net_send_to
+        }
+            
+
     room->collecting_fid++;                     // 推进帧号
     room->collect_begin_ms = kfs_now_ms();
+    room->recv_mask = 0;                        // 进入下一帧：清空收集位图
     room->tick_done = 1;                        // 本 tick 已推进一帧
 }
 
@@ -316,8 +323,11 @@ static void kfs_room_sync_check(kfs_netref *r, kfs_room *room)
         if (!KFS_PLAYER_ONLINE(pl))
             continue;
         if (!pl->state_valid[fid % KFS_PLAYER_BUF] ||
-            pl->state_hash[fid % KFS_PLAYER_BUF] == 0)
-            return;                     // 尚未全员上报，等下个 tick
+            pl->state_hash[fid % KFS_PLAYER_BUF] == 0) {
+            if (pl->offline || pl->fid_last + KFS_PLAYER_BUF < fid)
+                continue;               // 已掉线/明显滞后：本帧对账豁免
+            return;                     // 正常在线但未报：等下个 tick
+        }
     }
     // 取第一个在线玩家的哈希作基准；无在线玩家则跳过对账
     first = 0;
@@ -342,6 +352,64 @@ static void kfs_room_sync_check(kfs_netref *r, kfs_room *room)
     room->sync_fid = fid;               // 一致点推进
     room->sync_valid = 1;
 }
+
+// 房间内所有「在线」玩家都 ready==1 时，向所有在线客户端广播 one-shot
+// 「全部就绪/开战」帧，并把房间推入收集态 phase=1。
+// 仅在驱动线程内调用（调用方已持有 r->lock）。
+static void kfs_room_check_all_ready(kfs_netref *r, kfs_room *room)
+{
+    int i, online = 0;
+    char pkt[KFS_FRAME_MAX_TOTAL];
+    uint32_t start_fid;
+    int ret;
+
+    if (room == NULL || room->player_count == 0)
+        return;
+    if (room->phase == 1)                 // 已开战：不重复广播
+        return;
+
+    // 1. 就绪判定：所有在线玩家 ready 必须都为 1；掉线玩家不参与判定
+    for (i = 0; i < (int)room->player_count; i++) {
+        kfs_player *pl = &room->players[i];
+        if (!KFS_PLAYER_ONLINE(pl))
+            continue;                     // 掉线/无 KCP：不计入就绪集合
+        online++;
+        if (!pl->ready)
+            return;                       // 仍有在线玩家未就绪：等其 ready 帧
+    }
+    if (online == 0)
+        return;                           // 无在线玩家，无需开战
+
+    // 2. 组装 one-shot 开战帧：起始帧号取当前 collecting_fid，无业务 payload
+    start_fid = room->collecting_fid;
+    char ack_buf[12];
+    int ack_len = 0;
+    uint64_t now = kfs_now_ms();               // 落临时变量再取址
+    memcpy(ack + ack_len, &now, 8); ack_len += 8;
+    ret = frame_encode2(pkt, (int)sizeof(pkt), KFS_CMD_ALL_READY,
+                        start_fid, ack_buf, 0);
+    if (ret < 0)
+        return;
+
+    // 3. 广播给所有在线客户端（仅 ONLINE 且有 KCP 的会话）
+    for (i = 0; i < (int)room->player_count; i++) {
+        kfs_player *pl = &room->players[i];
+        if (!KFS_PLAYER_ONLINE(pl))
+            continue;
+        LOG_DEBUGF("kfs_room_check_all_ready room_id=%d conv=%d start_fid=%u",
+                   room->room_id, pl->conv, start_fid);
+        ikcp_send(pl->kcp, pkt, ret);     // -> net_send_to
+    }
+
+    // 4. 进入开战/收集推帧状态：phase=1，重置本帧收集节拍与位图
+    room->phase = 1;
+    room->collecting_fid = 0;
+    room->recv_mask = 0;
+    memset(room->input_len, 0, sizeof(room->input_len));
+    room->collect_begin_ms = kfs_now_ms();
+    room->tick_done = 0;
+}
+
 
 // 从某玩家 KCP 会话解出完整帧，写入其超前输入缓冲（服务器侧驱动线程内调用）
 static void kfs_player_recv_pump(kfs_netref *r, kfs_player *pl, uint64_t now_ms)
@@ -368,8 +436,23 @@ static void kfs_player_recv_pump(kfs_netref *r, kfs_player *pl, uint64_t now_ms)
             continue;
         }
         if (type == KFS_CMD_READY) {
-            pl->ready = 1;                      // 客户端加载完毕，业务层可据此开战
+            LOG_DEBUGF("kfs_player_recv_pump 客户端ready room_id=%%d conv=%d fid=%u data=%s", room->room_id, pl->conv, fid, data);
+            pl->ready = 1;                      // 客户端加载连接完毕，业务层可据此开战
             pl->last_active_ms = now_ms;
+            // 
+            char ack_buf[5];
+            int sync_len = 0;
+            memcpy(ack_buf + sync_len, 1, 1);              sync_len += 1;
+            // 类型自定义 KFS_CMD_REJOIN_SYNC = 9 加到enum
+            char pkt[KFS_FRAME_MAX_TOTAL];
+            int ret = frame_encode2(pkt, sizeof(pkt), KFS_CMD_READY_ACK, 0, ack_buf, sync_len);
+            if (ret > 0) {
+                ikcp_send(pl->kcp, pkt, ret);
+            }
+
+            // 检查是否全部就绪，全部就绪广播给所有在线客户端
+            kfs_room_check_all_ready(r, room);
+
             continue;
         }
         if (type == KFS_CMD_STATE) {
@@ -389,7 +472,7 @@ static void kfs_player_recv_pump(kfs_netref *r, kfs_player *pl, uint64_t now_ms)
         // 输入合法性校验（P0-4）
         if (dlen > KFS_ROOM_INPUT_MAX)
             continue;                           // 超长输入：拒绝
-        if ((uint32_t)(fid - room->collecting_fid) > KFS_PLAYER_BUF)
+        if (fid > room->collecting_fid + KFS_PLAYER_BUF || fid < room->sync_fid)
             continue;                           // 超前超过缓冲窗口：拒绝（防灌帧/异常帧号）
 
         // 写入超前输入缓冲（环形，按 fid 取槽）。不做即时集齐——由每 tick
@@ -402,6 +485,12 @@ static void kfs_player_recv_pump(kfs_netref *r, kfs_player *pl, uint64_t now_ms)
             memcpy(pf->data, data, (size_t)dlen);
         pl->fid_last = fid;
         pl->last_active_ms = now_ms;            // 任何输入都算活跃
+
+        // 收齐本帧输入即在房间位图打点（供 try_advance O(1) 判集齐）
+        if (fid == room->collecting_fid &&
+            pl->slot_index >= 0 && pl->slot_index < KFS_ROOM_MAX_PLAYER)
+            room->recv_mask |= (1U << pl->slot_index);
+        LOG_DEBUGF("KFS_CMD_INPUT conv=%d fid=%d data=%s", pl->conv, fid, data);
     }
 }
 
@@ -410,46 +499,33 @@ static void kfs_player_recv_pump(kfs_netref *r, kfs_player *pl, uint64_t now_ms)
 static void kfs_room_timeout_tick(kfs_netref *r, kfs_room *room,
                                   uint64_t now_ms)
 {
-    char pkt[KFS_FRAME_MAX_TOTAL];
-    int total, i;
-
+    if (room->phase != 1) 
+        return;
     if (room->player_count == 0 || room->tick_done)
         return;
     if (now_ms - room->collect_begin_ms < room->timeout_ms)
         return;
 
+    char pkt[KFS_FRAME_MAX_TOTAL];
+    int total, i;
+    
+    LOG_DEBUGF("kfs_room_timeout_tick room_id=%d collecting_fid=%u", room->room_id, room->collecting_fid);
     // input_buf 保留最近一次集齐广播时的全员输入，直接以其推进
     total = kfs_room_build_broadcast(room, pkt, (int)sizeof(pkt));
     if (total < 0)
         return;
     for (i = 0; i < (int)room->player_count; i++)
-        if (KFS_PLAYER_ONLINE(&room->players[i]))
+        if (KFS_PLAYER_ONLINE(&room->players[i])){
+            LOG_DEBUGF("kfs_room_timeout_tick room_id=%d conv=%d collecting_fid=%u", room->room_id, room->players[i].conv, room->collecting_fid);
             ikcp_send(room->players[i].kcp, pkt, total);
-
+        }
+        
     room->collecting_fid++;                     // 推进帧号
     room->collect_begin_ms = now_ms;
+    room->recv_mask = 0;                        // 超时强推：位图随之作废重收
     room->tick_done = 1;                        // 本 tick 已推进一帧
 }
 
-
-static int kfs_room_check_token(kfs_room *room, uint32_t conv, uint32_t token)
-{
-    LOG_DEBUGF(" JOIN 检验 token conv=%u, token=%u, ptoken_count=%d", conv, token, (int)room->ptoken_count);
-    int i;
-    for (i = 0; i < (int)room->ptoken_count; i++) {
-        LOG_DEBUGF(" JOIN token 匹配 i=%d, iconv=%u, itoken=%u", i, room->ptokens[i].conv, room->ptokens[i].token);
-        if (room->ptokens[i].conv == conv){
-            LOG_DEBUGF(" JOIN token 匹配 conv=%u, token=%u", conv, token);
-            if (room->ptokens[i].valid)
-                return room->ptokens[i].token == token;   // 该 conv 有专属 token
-            else
-                return 0;
-        }
-    }
-    // if (room->room_token != 0)
-    //     return room->room_token == token;             // 回退房间级 token
-    return 0;                                          // 未配置鉴权 → 放行
-}
 
 // 登记一个玩家(conv)的会话 token（per-player 鉴权）。
 //   已登记则覆盖；返回 0 成功；-1 表满。
@@ -484,28 +560,30 @@ static void kfs_srv_handle_join(kfs_netref *r, uint32_t room_id,
     kfs_room *room = kfs_room_find(r, room_id);
     char ack[5];
     uint32_t m = KFS_HANDSHAKE_MAGIC;
-    uint8_t result;
+    uint8_t result = KFS_CODE_SUCCESS;
     int rc;
 
     if (room == NULL) {
         LOG_DEBUGF(" kfs_srv_handle_join 房间不存在 room_id=%d, conv=%u, token=%u", room_id, conv, token);
-        result = 1;                               // 房间不存在
-    } else if (!kfs_room_check_token(room, conv, token)) {
-        LOG_DEBUGF(" kfs_srv_handle_join token 错误 room_id=%d, conv=%u, token=%u", room_id, conv, token);
-        result = 5;                               // token 错误（鉴权失败）
-    } else {
-        rc = kfs_srv_add_player_c(r, room, conv, peer);
-        result = (rc == 0)  ? 0     // 成功
-                 : (rc == -1) ? 6   // 修正：conv 不在房间名单/未授权（原误映射成 2=满）
-                 : (rc == -2) ? 3   // conv 已在线在房
-                 : (rc == -3) ? 4   // KCP 创建失败（add_player 里有 -3 分支）
-                 : 4;               // 其他
-
-        LOG_DEBUGF(" kfs_srv_handle_join result=%d room_id=%d, conv=%u, token=%u", result, room_id, conv, token);
+        result = KFS_CODE_ERROR_ROOM_NULL;                               // 房间不存在
     }
-    memcpy(ack, &m, 4);
-    ack[4] = (char)result;
-    net_send_to(r->net, peer, ack, 5);            // 裸 ACK 发回客户端
+
+    if (result == KFS_CODE_SUCCESS) {
+        // 处理token鉴权和建立/更新连接
+        result = kfs_srv_add_player_c(r, room, conv, token, peer);
+        if (result != KFS_CODE_SUCCESS) {
+            LOG_DEBUGF("kfs_srv_handle_join add_player fail, code=%d room_id=%u conv=%u token=%u",
+                result, room_id, conv, token);
+        }
+    }
+
+    if (result != KFS_CODE_SUCCESS)
+    {
+        memcpy(ack, &m, 4);
+        ack[4] = (char)result;
+        net_send_to(r->net, peer, ack, 5);            // 裸 ACK 发回客户端
+    }
+    
 }
 
 //---------------------------------------------------------------------
@@ -569,11 +647,21 @@ void *kfs_drive_thread(void *arg)
                 kfs_srv_handle_join(r, room_id, jconv, jtok, &from);
                 continue;
             }
-            memcpy(&conv, buf, 4);              // KCP 包头 4 字节即 conv（host order）
+            memcpy(&conv, buf, 4);
             pl = kfs_find_player(r, conv);
             if (pl) {
+                // 仅"已掉线"时才从新源学习对端：在线态的对端由成功 JOIN 权威设定，
+                // 防止旧链路超时前的残留杂包把 peer 反向改回旧地址造成下行抖动。
+                if (KFS_PLAYER_ONLINE(pl) && pl->offline &&
+                    (pl->peer.sin_addr.s_addr != from.sin_addr.s_addr ||
+                     pl->peer.sin_port        != from.sin_port)) {
+                    pl->peer    = from;     // ctx.peer 指向 &pl->peer，自动跟随
+                    pl->offline = 0;        // 收到有效包即视为恢复
+                    LOG_DEBUGF("conv=%u 由新源恢复 peer=%s:%u", conv,
+                        inet_ntoa(from.sin_addr), ntohs(from.sin_port));
+                }
                 ikcp_input(pl->kcp, buf, (long)rcv);
-                kfs_player_recv_pump(r, pl, (uint64_t)now);   // 写缓冲/保活
+                kfs_player_recv_pump(r, pl, (uint64_t)now);
             } else {
                 ikcpcb *kcp = netref_route_find(r, conv);
                 if (kcp)
@@ -675,7 +763,7 @@ int kfs_srv_new_room_c(kfs_netref *r, uint32_t room_id,
                               const uint32_t *init_convs, int init_count)
 {
     kfs_room *nr;
-    int i;
+    int i, j, k;
 
     if (init_count <= 0 || init_count > KFS_ROOM_MAX_PLAYER)
         return -3;                              // 初始玩家数异常
@@ -690,12 +778,42 @@ int kfs_srv_new_room_c(kfs_netref *r, uint32_t room_id,
         r->rooms = nr;
         r->room_cap = newcap;
     }
+
+    // 对每一个要加入新房间的初始conv，遍历全房间表，把旧房间里的该玩家踢为LEFT
+    for (i = 0; i < init_count; i++) {
+        uint32_t chk_conv = init_convs[i];
+        int found_old = 0;
+        for (j = 0; j < r->room_count; j++) {
+            kfs_room *or = &r->rooms[j];
+            for (k = 0; k < (int)or->player_count; k++) {
+                kfs_player *opl = &or->players[k];
+                if (opl->conv == chk_conv && opl->state != KFS_PSTATE_LEFT) {
+                    if (opl->kcp) { ikcp_release(opl->kcp); opl->kcp = NULL; }
+                    opl->state = KFS_PSTATE_LEFT;
+                    opl->offline = 1;
+                    memset(opl->pend, 0, sizeof(opl->pend));
+                    found_old = 1;
+                    break;
+                }
+            }
+            if (found_old) break;
+        }
+    }
+
+    uint32_t room_seed = kfs_rng_next();
+    if (room_seed == 0)
+    {
+        LOG_DEBUGF("kfs_srv_new_room_c 初始化随机因子失败");
+        room_seed = (uint32_t)kfs_now_ms() | 1u;   // 兜底非零，避免 seed 恒为 0
+    }
+    
     nr = &r->rooms[r->room_count];
     memset(nr, 0, sizeof(*nr));
     nr->room_id = room_id;
+    nr->room_seed = room_seed;          // 关键：把随机因子持久化，重连才能回滚 RNG
     nr->max_player = 0;                // 设定的最大玩家数（满员判定用）
     nr->init_count = init_count;                // 初始玩家预登记数
-    nr->player_count = 0;
+    nr->player_count = init_count;
     nr->phase = 0;                      // 准备阶段：等全员就绪后由业务层 start() 开推
     nr->collecting_fid = 0;
     nr->recv_mask = 0;
@@ -714,17 +832,13 @@ int kfs_srv_new_room_c(kfs_netref *r, uint32_t room_id,
         pl->slot_index = i;
         pl->last_active_ms = kfs_now_ms();      // 创建起即计活跃，避免立即被判掉线
     }
-    nr->player_count = init_count;
     nr->ptoken_count = 0;
     r->room_count++;
     return 0;
 }
 
 // JOIN 登记：把玩家(conv)加入房间并建立连接（调用方须已持有 r->lock）。
-//   1) 全局排重：该 conv 若已占位在**其他**房间（INIT/ONLINE）→ 先在旧房间
-//      设置状态（置 LEFT 已转房、释放其 KCP、席位保留），再加入本房间——
-//      防止同一玩家同时挂两个房间；
-//   2) 目标房间内按 conv 复用槽位：
+//   目标房间内按 conv 复用槽位：
 //        INIT（初始登记）      → 升级 ONLINE（首连）
 //        ONLINE 且掉线(offline)→ 恢复 ONLINE（掉线重连）
 //        ONLINE 且在线         → 返回 -2（重复 JOIN）
@@ -732,66 +846,143 @@ int kfs_srv_new_room_c(kfs_netref *r, uint32_t room_id,
 //      无该 conv 槽位          → 末尾追加新成员 ONLINE（join 列表）
 //   3) 建立/更新 KCP 会话与对端地址（掉线重连沿用已有 KCP，仅更新对端）。
 //   返回 0 成功；-1 不在房间中；-2 conv 已在线在房；-3 KCP 创建失败。
-int kfs_srv_add_player_c(kfs_netref *r, kfs_room *room, uint32_t conv,
-                                const struct sockaddr_in *peer)
+int kfs_srv_add_player_c(kfs_netref *r, kfs_room *room, uint32_t conv, uint32_t token,
+                         const struct sockaddr_in *peer)
 {
     kfs_player *pl = NULL;
     int i, j;
-
-    // 1) 全局排重：conv 已在其他房间（INIT/ONLINE）→ 旧房间设置状态 LEFT（转房）
-    for (i = 0; i < r->room_count; i++) {
-        kfs_room *or = &r->rooms[i];
-        if (or == room)
-            continue;
-        for (j = 0; j < (int)or->player_count; j++) {
-            kfs_player *opl = &or->players[j];
-            if (opl->conv == conv && opl->state != KFS_PSTATE_LEFT) {
-                // 转房：旧房间设置状态（已离开），释放连接，席位保留
-                if (opl->kcp) {
-                    ikcp_release(opl->kcp);
-                    opl->kcp = NULL;
-                }
-                opl->state = KFS_PSTATE_LEFT;
-                opl->offline = 1;
-                memset(opl->pend, 0, sizeof(opl->pend));
-                break;
-            }
+    int has_ptoken = 0;                 /* 该 conv 是否登记了专属 token */
+    /* 鉴权：per-player token 优先，未登记则回退房间级 token */
+    for (i = 0; i < (int)room->ptoken_count; i++) {
+        if (room->ptokens[i].conv == conv) {
+            has_ptoken = 1;
+            if (!room->ptokens[i].valid || room->ptokens[i].token != token)
+                return KFS_CODE_ERROR_JOIN_TOKEN;     /* 配了专属 token 但本次不符 */
+            break;
         }
     }
-
-    // 2) 目标房间内按 conv 找槽位
+    if (!has_ptoken) {
+        /* 未登记专属 token：回退房间级 token（room_token==0 表示不校验） */
+        if (room->room_token != 0 && room->room_token != token)
+            return KFS_CODE_ERROR_JOIN_TOKEN;
+    }
+    /* 2) 目标房内按 conv 找槽位；不在初始名单一律拒绝（不再追加） */
     for (i = 0; i < (int)room->player_count; i++) {
         if (room->players[i].conv == conv) {
             pl = &room->players[i];
-            if (KFS_PLAYER_ACTIVE(pl))
-                return -2;                      // 已在线在房：重复 JOIN
-            break;                              // INIT / offline / LEFT：复用升级
+            break;
         }
     }
-    if (pl == NULL) {
-        // 初始列表没有，就是有问题
-        return -1;
+    if (pl == NULL)
+        return KFS_CODE_ERROR_NOT_IN_ROOM;          /* 名单外：拒绝 */
+
+    if (pl->state == KFS_PSTATE_LEFT)
+    {
+        return KFS_CODE_ERROR_NOT_IN_ROOM;          /* 玩家主动退出 */
+    }
+    
+    // 已经在线且未掉线 → 拒绝重连握手，防止误杀正常KCP
+    if (pl->state == KFS_PSTATE_ONLINE && !pl->offline)
+    {
+        // 源地址完全一致才是真重复握手 → 拒绝
+        if (pl->peer.sin_addr.s_addr == peer->sin_addr.s_addr &&
+            pl->peer.sin_port        == peer->sin_port)
+            return KFS_CODE_ERROR_ALREADY_ONLINE;
+        // 源地址变化 → 判定换网络重连，放行：下方释放旧KCP、用新peer重建会话
+        LOG_DEBUGF("换网络重连 conv=%u 新peer:%s:%u", conv,
+            inet_ntoa(peer->sin_addr), ntohs(peer->sin_port));
     }
 
-    // 3) 建立/更新连接：INIT/LEFT 建 KCP；掉线重连沿用已有 KCP，更新对端地址
+    int is_rejoin = (pl->kcp != NULL);   // 放 ikcp_release 之前先记录：原来是否已有连接
+
+    /* 3) 建立/更新连接：INIT/LEFT/掉线重连 重建 KCP */
+    if (pl->kcp)
+        ikcp_release(pl->kcp);
     pl->peer = *peer;
     pl->ctx.r = r;
     pl->ctx.peer = &pl->peer;
-    if (pl->kcp == NULL || pl->offline || pl->state == KFS_PSTATE_LEFT) {
-        if (pl->kcp)
-            ikcp_release(pl->kcp);              // 掉线重连/LEFT 回归：释放旧 KCP 重建，SN 对齐
-        pl->kcp = ikcp_create(conv, (void *)&pl->ctx);
-        if (pl->kcp == NULL)
-            return -3;                          // KCP 创建失败
-        ikcp_setoutput(pl->kcp, kfs_output);
-        ikcp_nodelay(pl->kcp, 1, 10, 2, 1);
-    }
-    pl->state = KFS_PSTATE_ONLINE;             // 升级/恢复在线
+    pl->kcp = ikcp_create(conv, (void *)&pl->ctx);
+    if (!pl->kcp) return KFS_CODE_ERROR_CREATE_KCPCB;
+    ikcp_setoutput(pl->kcp, kfs_output);
+    ikcp_nodelay(pl->kcp, 1, 10, 2, 1);
+    
+    pl->state   = KFS_PSTATE_ONLINE;
     pl->offline = 0;
-    pl->last_active_ms = kfs_now_ms();          // join 即视为活跃
-    LOG_DEBUGF("kfs_srv_add_player_c 建立/更新连接 conv=%d, room_id=%u", conv, room->room_id);
-    return 0;
+    pl->ready   = 0;
+    pl->last_active_ms = kfs_now_ms();
+    // if (room->phase == 0)
+    //     kfs_room_push_ready_event(r, room);   // 业务据此重算就绪、决定 start()
+
+    // 新增1+2 合并：先无条件清本玩家收集位，再做窗口裁剪，
+    // 最后若 collecting_fid 帧输入仍有效则重新置位，保持位图与 pend 一致。
+    if (pl->slot_index >= 0 && pl->slot_index < KFS_ROOM_MAX_PLAYER)
+        room->recv_mask &= ~(1U << pl->slot_index);
+
+    uint32_t base_fid    = room->sync_valid ? room->sync_fid : 0;
+    uint32_t max_allow   = room->collecting_fid + KFS_PLAYER_BUF;
+    int b;
+    for (b = 0; b < KFS_PLAYER_BUF; b++) {
+        kfs_pframe *pf = &pl->pend[b];
+        if (pf->valid && (pf->fid < base_fid || pf->fid > max_allow))
+            pf->valid = 0;
+    }
+    if (pl->slot_index >= 0 && pl->slot_index < KFS_ROOM_MAX_PLAYER) {
+        kfs_pframe *cur = &pl->pend[room->collecting_fid % KFS_PLAYER_BUF];
+        if (cur->valid && cur->fid == room->collecting_fid)
+            room->recv_mask |= (1U << pl->slot_index);   // 本帧输入确实还在 → 补置位
+    }
+    
+    uint32_t sfid = room->sync_valid ? room->sync_fid : 0;
+    uint32_t cfid = room->collecting_fid;
+
+    uint8_t result = KFS_CODE_SUCCESS;
+    uint32_t m = KFS_HANDSHAKE_MAGIC;
+    char ack[32];                       // 放大：实际写 21 字节，留余量
+    uint8_t ack_len = 0;
+    // JOIN 应答：[magic 4B][result 1B][frame_interval_ms 4B][room_seed 4B][server_time_ms 8B] = 21B
+    memcpy(ack + ack_len, &m, 4); ack_len += 4;
+    ack[ack_len++] = (char)result;
+    uint32_t fi = r->frame_interval_ms;
+    memcpy(ack + ack_len, &fi, 4); ack_len += 4;
+    uint32_t seed = room->room_seed;           // 注意是 room 不是 r，且 4 字节
+    memcpy(ack + ack_len, &seed, 4); ack_len += 4;
+    uint64_t now = kfs_now_ms();               // 落临时变量再取址
+    memcpy(ack + ack_len, &now, 8); ack_len += 8;
+    net_send_to(r->net, peer, ack, ack_len);
+    if (is_rejoin) {//暂时不启用
+        // // ==========【新增3：给这个重连玩家下发锚点同步包（业务快照包，这里发锚控制帧）】==========
+        // // 业务层可以在这里打包【当前房间所有玩家状态快照】一起下发
+        // char sync_buf[128];
+        // int sync_len = 0;
+        // memcpy(sync_buf + sync_len, &sfid, 4);              sync_len += 4;
+        // memcpy(sync_buf + sync_len, &cfid, 4);              sync_len += 4;
+        // memcpy(sync_buf + sync_len, &room->room_seed, 4);          sync_len += 4; // 新增
+        // memcpy(sync_buf + sync_len, &r->frame_interval_ms, 4);     sync_len += 4; // 新增
+        // // 类型自定义 KFS_CMD_REJOIN_SYNC = 9 加到enum
+        // char pkt[KFS_FRAME_MAX_TOTAL];
+        // int ret = frame_encode2(pkt, sizeof(pkt), 9/*KFS_CMD_REJOIN_SYNC*/, cfid, sync_buf, sync_len);
+        // if (ret > 0) {
+        //     ikcp_send(pl->kcp, pkt, ret);
+        // }
+    
+        // // ==========【新增4：房间广播：通知其他在线玩家：该conv重连上线】==========
+        // // 业务层收到这个广播，同步该玩家角色、buff、位置
+        // char evt_buf[32];
+        // int evt_len = 0;
+        // memcpy(evt_buf + evt_len, &conv, 4); evt_len +=4;
+        // for (int j = 0; j < (int)room->player_count; j++) {
+        //     kfs_player *other = &room->players[j];
+        //     if (KFS_PLAYER_ONLINE(other) && other != pl) {
+        //         int nret = frame_encode2(pkt, sizeof(pkt), 10/*KFS_CMD_PLAYER_REJOIN*/, cfid, evt_buf, evt_len);
+        //         if (nret > 0) ikcp_send(other->kcp, pkt, nret);
+        //     }
+        // }
+    }
+
+    LOG_DEBUGF("player join success room_id=%u, conv=%u, is_rejoin=%d, sync_fid=%u, collecting_fid=%u", room->room_id, conv, is_rejoin, sfid, cfid);
+    return KFS_CODE_SUCCESS;
 }
+
 
 // 主动移除玩家（业务层清理）：释放其 KCP（如有）、收缩成员数组。
 //   任何占位（INIT/ONLINE/LEFT）都可被移除；返回 0 成功；-1 不在房间。
@@ -812,9 +1003,11 @@ int kfs_srv_remove_player_c(kfs_netref *r, kfs_room *room,
     last = (int)room->player_count - 1;
     if (i != last) {
         room->players[i] = room->players[last];
+        // 关键：拷贝完结构体，修复peer自引用指针
+        room->players[i].ctx.peer = &room->players[i].peer;
         room->players[i].slot_index = i;
-        room->players[i].ctx.peer = &room->players[i].peer;   // 修正指针
     }
+
     memset(&room->players[last], 0, sizeof(kfs_player));
     room->players[last].room_index = -1;
     room->players[last].slot_index = -1;
@@ -847,6 +1040,10 @@ void kfs_srv_close_room_c(kfs_netref *r, kfs_room *room)
     for (i = idx; i < r->room_count; i++) {
         int j;
         for (j = 0; j < (int)r->rooms[i].player_count; j++)
-            r->rooms[i].players[j].room_index = i;
+        {
+            kfs_player *pl = &r->rooms[i].players[j];
+            pl->room_index = i;
+            pl->ctx.peer = &pl->peer; // 补上！
+        }
     }
 }
