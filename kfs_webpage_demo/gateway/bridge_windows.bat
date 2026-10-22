@@ -1,1 +1,0 @@
-node .\bridge_windows.js

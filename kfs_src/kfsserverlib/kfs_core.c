@@ -266,14 +266,24 @@ static void kfs_room_try_advance(kfs_netref *r, kfs_room *room)
     if (room->player_count == 0 || room->tick_done)
         return;
     fid = room->collecting_fid;
-    // 用 recv_mask 位图 O(1) 判集齐：活跃玩家的对应位必须都已置 1。
+    // 用 recv_mask 位图判集齐：活跃玩家的对应位必须都已置 1。
+    // 注意：位图只在"输入到达时刻恰等于 collecting_fid"时由收包泵置位，
+    // 而客户端带超前窗口（advance_frames），输入通常先于 collecting 到达、
+    // 只躺在 pend 缓冲里。故此处对未置位的玩家先自查 pend（与 rejoin 路径
+    // 同款自愈）；否则帧永远只能靠 timeout 兜底携带旧输入空转。
     // 掉线玩家（offline=1）不参与判定，广播时用其 input_buf 最近输入填充。
     for (i = 0; i < (int)room->player_count; i++) {
         kfs_player *pl = &room->players[i];
         if (!KFS_PLAYER_ACTIVE(pl))
             continue;
-        if (!(room->recv_mask & (1U << pl->slot_index)))
-            return;                             // 本帧尚缺该玩家输入，等下个 tick
+        if (!(room->recv_mask & (1U << pl->slot_index))) {
+            kfs_pframe *cur = &pl->pend[fid % KFS_PLAYER_BUF];
+            if (pl->slot_index >= 0 && pl->slot_index < KFS_ROOM_MAX_PLAYER &&
+                cur->valid && cur->fid == fid)
+                room->recv_mask |= (1U << pl->slot_index);  // 输入早已到达：补位
+            else
+                return;                             // 本帧尚缺该玩家输入，等下个 tick
+        }
     }
     LOG_DEBUGF("kfs_room_try_advance room_id=%d fid=%u", room->room_id, fid);
     // 齐了：把本帧输入写回 input_buf/input_len（供广播构建与超时填充）
@@ -371,7 +381,7 @@ static void kfs_room_check_all_ready(kfs_netref *r, kfs_room *room)
     // 1. 就绪判定：所有在线玩家 ready 必须都为 1；掉线玩家不参与判定
     for (i = 0; i < (int)room->player_count; i++) {
         kfs_player *pl = &room->players[i];
-        if (!KFS_PLAYER_ONLINE(pl))
+        if (!(KFS_PLAYER_ONLINE(pl)||KFS_PLAYER_INIT(pl)))
             continue;                     // 掉线/无 KCP：不计入就绪集合
         online++;
         if (!pl->ready)
@@ -385,7 +395,7 @@ static void kfs_room_check_all_ready(kfs_netref *r, kfs_room *room)
     char ack_buf[12];
     int ack_len = 0;
     uint64_t now = kfs_now_ms();               // 落临时变量再取址
-    memcpy(ack + ack_len, &now, 8); ack_len += 8;
+    memcpy(ack_buf + ack_len, &now, 8); ack_len += 8;
     ret = frame_encode2(pkt, (int)sizeof(pkt), KFS_CMD_ALL_READY,
                         start_fid, ack_buf, 0);
     if (ret < 0)
@@ -436,13 +446,13 @@ static void kfs_player_recv_pump(kfs_netref *r, kfs_player *pl, uint64_t now_ms)
             continue;
         }
         if (type == KFS_CMD_READY) {
-            LOG_DEBUGF("kfs_player_recv_pump 客户端ready room_id=%%d conv=%d fid=%u data=%s", room->room_id, pl->conv, fid, data);
+            LOG_DEBUGF("kfs_player_recv_pump 客户端ready room_id=%d conv=%d fid=%u", room->room_id, pl->conv, fid);
             pl->ready = 1;                      // 客户端加载连接完毕，业务层可据此开战
             pl->last_active_ms = now_ms;
             // 
             char ack_buf[5];
             int sync_len = 0;
-            memcpy(ack_buf + sync_len, 1, 1);              sync_len += 1;
+            ack_buf[sync_len++] = 1;            // 修复：原 memcpy(…,1,1) 把整数1当指针解引用
             // 类型自定义 KFS_CMD_REJOIN_SYNC = 9 加到enum
             char pkt[KFS_FRAME_MAX_TOTAL];
             int ret = frame_encode2(pkt, sizeof(pkt), KFS_CMD_READY_ACK, 0, ack_buf, sync_len);
@@ -581,7 +591,10 @@ static void kfs_srv_handle_join(kfs_netref *r, uint32_t room_id,
     {
         memcpy(ack, &m, 4);
         ack[4] = (char)result;
-        net_send_to(r->net, peer, ack, 5);            // 裸 ACK 发回客户端
+        int ret5 = net_send_to(r->net, peer, ack, 5);
+        LOG_DEBUGF("JOIN_ACK 回包(失败) conv=%u peer=%s:%u sent=%d result=%u",
+            conv, inet_ntoa(peer->sin_addr), ntohs(peer->sin_port), ret5,
+            (unsigned)result);
     }
     
 }
@@ -948,7 +961,10 @@ int kfs_srv_add_player_c(kfs_netref *r, kfs_room *room, uint32_t conv, uint32_t 
     memcpy(ack + ack_len, &seed, 4); ack_len += 4;
     uint64_t now = kfs_now_ms();               // 落临时变量再取址
     memcpy(ack + ack_len, &now, 8); ack_len += 8;
-    net_send_to(r->net, peer, ack, ack_len);
+    int ack_ret = net_send_to(r->net, peer, ack, ack_len);
+    LOG_DEBUGF("JOIN_ACK 回包 conv=%u peer=%s:%u sent=%d result=%u acklen=%u",
+        conv, inet_ntoa(peer->sin_addr), ntohs(peer->sin_port), ack_ret,
+        (unsigned)result, (unsigned)ack_len);
     if (is_rejoin) {//暂时不启用
         // // ==========【新增3：给这个重连玩家下发锚点同步包（业务快照包，这里发锚控制帧）】==========
         // // 业务层可以在这里打包【当前房间所有玩家状态快照】一起下发

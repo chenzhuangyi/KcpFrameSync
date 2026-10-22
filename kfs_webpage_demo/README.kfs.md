@@ -225,10 +225,10 @@ docker restart ctn_centos7
 # 容器重启后重新启动 server.lua（见下面“只保留一个 server.lua”）
 ```
 
-如果网关日志里的目标端口不是 10500（例如 `UDP 目标 127.0.0.1:10501`），说明走的是
-`bridge_windows.js -> bridge_container.js` 桥链路，必须两个桥都在运行；直连 Docker
-服务器时不要用 10501，设 `KFS_SERVER_PORT=10500`（网关默认也会读 `lua_test/config`
-的 `udp_port`）后重启网关。
+如果网关日志里的目标端口不是 10500（例如显示 `UDP 目标 127.0.0.1:10501`），说明
+`KFS_SERVER_PORT` 或 `lua_test/config` 的 `udp_port` 被改过。中转桥已移除，网关与
+Unity 一律直连服务器 UDP 端口：设 `KFS_SERVER_PORT=10500`（或改回 config 的
+`udp_port`）后重启网关即可。
 
 ### 症状 A2：有 UDP 监听，但网关仍 JOIN 超时（IPv6-only 发布）
 
@@ -296,60 +296,17 @@ docker exec -d ctn_centos7 bash -lc "cd /root/project/KcpFrameSync/lua_test && e
 
 ---
 
-## 八、Unity 开发：UDP↔TCP 桥（server 仍在 Docker Desktop）
+## 八、Unity 开发：直连服务器 UDP
 
-Docker Desktop for Windows 的宿主机 UDP 端口代理不可靠（gVisor/VPNKit），
-Unity 直接 UDP 连 `127.0.0.1:10500` 会间歇性超时。桥接方案不需要改服务端：
-
-```text
-Unity --UDP 127.0.0.1:10501--> bridge_windows.js
-      --TCP 127.0.0.1:10500--> bridge_container.js（容器内）
-      --UDP 127.0.0.1:10500--> server.lua
-```
-
-### 启动
-
-```powershell
-# 1. 容器内：server + 网页网关 + UDP/TCP 桥
-docker exec ctn_centos7 /root/project/KcpFrameSync/kfs-gateway/start_container.sh 1 1
-# 双人房用 1 2
-
-# 2. Windows：启动本机桥（保持这个终端开着）
-cd D:\project\KcpFrameSync\kfs_webpage_demo\gateway
-node bridge_windows.js
-```
-
-### Unity 侧
-
-kfs 客户端只改目标端口：
+中转桥（`bridge_windows.js` / `bridge_container.js` / 10501 端口）已移除。Unity 侧
+kfs 客户端的 `setpeer` 直接指向服务器发布的 UDP 端口（默认 10500）：
 
 ```csharp
-c.setpeer("127.0.0.1", 10501);   // 原来是 10500
+// Docker 宿主机在 Windows 上时，用宿主机 IP；网关/服务器同机时用 127.0.0.1
+c.setpeer("127.0.0.1", 10500);
 ```
 
 房间、conv、token、JOIN/KCP/心跳/广播协议都不变。
 
-### 端口
-
-| 段 | 协议/端口 | 说明 |
-|---|---|---|
-| Unity → Windows 桥 | UDP `127.0.0.1:10501` | `bridge_windows.js` 监听 |
-| Windows 桥 → 容器桥 | TCP `127.0.0.1:10500` | Docker 已发布，稳定 |
-| 容器桥 → server | UDP `127.0.0.1:10500` | 容器内 loopback |
-
-### 多客户端
-
-Windows 桥按 Unity 的源 `ip:port` 分别建 TCP 连接；容器桥为每条连接建独立
-UDP socket。服务器看到的是多个不同 UDP 源，JOIN/KCP 按 conv 正常工作。
-每个 Unity 客户端仍需自己的 conv/token（和直连时一样）。
-
-### 注意
-
-- `bridge_windows.js` 必须保持运行；Unity 断开后桥会在空闲 5 分钟后清理映射。
-- 容器重启后重新执行 `start_container.sh`；Windows 桥不用重启，下个 UDP 包会自动重连。
-- 桥重启会让正在进行的 KCP 会话断开，Unity 客户端需要重新 JOIN。
-- 想验证桥是否通：
-  ```powershell
-  node test_bridge_kcp.js <当前token>
-  ```
-  收到 `JOIN ACK result=0` 和 `BROADCAST ... data=34` 即成功。
+> Docker Desktop for Windows 的宿主机 UDP 端口代理偶发丢失时，`docker restart
+> ctn_centos7` 后重跑 `start_container.sh` 即可恢复，不再需要中转桥。

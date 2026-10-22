@@ -9,7 +9,7 @@
 #
 # 环境变量：
 #   START_GATEWAY=0     只起服务器，不起网页网关
-#   RESTART_GATEWAY=1   先杀旧 gateway.js / bridge_container.js 再起（改过网关代码或端口后用）
+#   RESTART_GATEWAY=1   先杀旧 gateway.js 再起（改过网关代码或端口后用）
 #   KFS_SERVER_PORT     覆盖网关连的 UDP 端口（默认读 lua_test/config 的 udp_port，再退回 10500）
 #
 # 重要：脚本按“自身所在目录”定位 ../kfs_src 和 ../lua_test，不再依赖当前工作目录。
@@ -117,27 +117,14 @@ if [ "$START_GATEWAY" = "1" ]; then
         fi
     fi
 else
-    echo "跳过网页网关（START_GATEWAY=0）；Unity 仍可使用 TCP 10500 桥"
+    echo "跳过网页网关（START_GATEWAY=0）"
 fi
 
 #---------------------------------------------------------------------
-# 3) Unity 用的 UDP↔TCP 桥：Windows 桥 -> tcp/10500 -> udp/$UDP_PORT
+# 3) （已移除）Unity 用的 UDP↔TCP 中转桥：中转端口逻辑已删除，
+#    网关与 Unity 一律直连服务器 UDP 端口（默认 10500，读 lua_test/config）。
+#    若 Docker Desktop 宿主机 UDP 发布异常，docker restart 容器后重跑本脚本即可。
 #---------------------------------------------------------------------
-if [ "$RESTART_GATEWAY" = "1" ]; then
-    pkill -f '[b]ridge_container.js' >/dev/null 2>&1 || true
-    sleep 0.2
-fi
-if ! pgrep -f '[b]ridge_container.js' >/dev/null; then
-    cd "$GW_DIR" || exit 1
-    BRIDGE_TCP_PORT=10500 \
-    BRIDGE_SERVER_HOST=127.0.0.1 \
-    BRIDGE_SERVER_PORT="$UDP_PORT" \
-    nohup "$NODE" bridge_container.js > bridge.log 2>&1 &
-    sleep 0.5
-    echo "容器内 UDP/TCP 桥已启动 tcp/10500 -> udp 127.0.0.1:$UDP_PORT"
-else
-    echo "容器内 UDP/TCP 桥已在运行"
-fi
 
 echo "--- tokens ---"
 cat "$LUA_DIR/tokens_1.txt" 2>/dev/null || echo "tokens_1.txt 尚未生成"

@@ -1,79 +1,118 @@
 // ============================================================
-// 帧同步逻辑验证 Demo —— WebSocket 真客户端（经网关连 Docker kfs 服务器）
+// 坦克对战 · 帧同步验证 Demo —— WebSocket 真客户端（经网关连 Docker kfs 服务器）
 //
 // 链路：浏览器(WebSocket) ⇄ gateway.js(本机 Node) ⇄ UDP/KCP ⇄ Docker kfs 服务器
+// （中转桥已移除，网关直连服务器 UDP 端口）
 //
 // 协议对齐 kfs 库真实客户端（kfs_client_core.c / client.lua）：
-//   1. 登录填 room_id / conv / token → 网关代发裸 UDP JOIN 握手（服务器校验
-//      room_id + conv + token，回 ACK result）
-//   2. joined 成功后 send_ready()（KCP 内 READY 帧，等待 server.lua room:start）
-//   3. 输入提前量：topup() 把输入补发到 next_fid + advance_frames(=2)
-//      （服务器从玩家超前缓冲按帧号取全员输入推进，标准帧同步输入窗口）
-//   4. 收到服务器广播 → 解析逐玩家 [conv 4B][len 2B][data] + 尾 4B 对账哈希
-//      → 本地确定性状态推进 → 上报 STATE 哈希（h=(h*31+byte)%2^32，对齐
-//      client.lua 的 report_state）
-//   5. 心跳由网关按 heartbeat_ms 自动补发 HEARTBEAT 帧（对齐 set_heartbeat）
-//   6. 锁步：所有客户端都收到广播 min_bfid 后，裁决帧号才推进到 min_bfid+1
-//      并 topup，保证全员上报帧号对齐
+//   1. 登录填 room_id / conv / token → 网关代发裸 UDP JOIN 握手
+//   2. joined 成功后 send_ready()（等 server.lua room:start 推帧）
+//   3. 输入提前量：topup() 补发到 next_fid + advance_frames(=2)
+//   4. 收到广播 → 解析逐玩家输入 → 本地确定性推进坦克/子弹 → 上报 STATE 哈希
+//   5. 心跳由网关按 heartbeat_ms 自动补发
+//
+// 玩法（确定性，全员同输入同种子 → 同结果）：
+//   · 地图带固定障碍；坦克有朝向炮管，可发射子弹
+//   · 每人 lives 条命（登录可配，默认 3），一次中弹=死一条命；初始位置按玩家序号 p1,p2.. 固定槽位
+//   · 死亡后 2s（按帧数换算，非真实时钟）在空闲槽位确定性随机复活；命耗尽=淘汰不再复活
+//   · 子弹击杀计入 killer 统计；仅剩 1 名仍有命的玩家（且房内 ≥2 人）→ 判胜并停止发包
+//
+// 输入编码（2 字节 ASCII，服务器透明搬运并进对账哈希）：
+//   byte0 = 方向 '0'..'4'（STOP/UP/DOWN/LEFT/RIGHT）  byte1 = 开火 '0'/'1'
 // ============================================================
 
 var DIRECTION = { STOP:0, UP:1, DOWN:2, LEFT:3, RIGHT:4 };
 var DIR_KEYS   = { 38:DIRECTION.UP, 40:DIRECTION.DOWN, 37:DIRECTION.LEFT, 39:DIRECTION.RIGHT, 13:DIRECTION.STOP };
+var FIRE_KEYS  = { 32:true };            // 空格开火
 
 var WIDTH=600, HEIGHT=420, BOX_SIZE=26;
-var COLORS=["#e74c3c","#3498db","#27ae60","#9b59b6","#f39c12","#1abc9c","#e67e22","#2c3e50"];
+var COLORS=["#e74c3c","#3498db","#27ae60","#9b59b6","#f39c12","#1abc9c","#e67e22","#2c3e50",
+            "#c0392b","#2980b9","#16a085","#8e44ad","#d35400","#f1c40f","#7f8c8d","#16a085"];
 
-// ---------- hex 工具（网关二进制字段用 hex 传输）----------
+// ---------- 地图障碍（固定矩形，跨端一致；已避开 32 个出生槽）----------
+var BARRIERS=[
+	{x:150,y:70, w:40,h:40},{x:410,y:70,w:40,h:40},
+	{x:150,y:310,w:40,h:40},{x:410,y:310,w:40,h:40},
+	{x:260,y:180,w:80,h:60},
+	{x:90,y:190,w:40,h:40},{x:470,y:190,w:40,h:40},
+	{x:280,y:70,w:40,h:40},{x:280,y:310,w:40,h:40}
+];
+
+// ---------- 32 个固定出生槽（上8/下8/左8/右8，避开障碍与边界）----------
+var SLOT_POS=(function(){
+	var s=[], i, m=6;
+	for(i=0;i<8;i++) s.push({x:Math.round(m+i*(WIDTH-2*m-BOX_SIZE)/7), y:m});
+	for(i=0;i<8;i++) s.push({x:Math.round(m+i*(WIDTH-2*m-BOX_SIZE)/7), y:HEIGHT-m-BOX_SIZE});
+	for(i=0;i<8;i++) s.push({x:m, y:Math.round(m+8+i*(HEIGHT-2*m-16-BOX_SIZE)/7)});
+	for(i=0;i<8;i++) s.push({x:WIDTH-m-BOX_SIZE, y:Math.round(m+8+i*(HEIGHT-2*m-16-BOX_SIZE)/7)});
+	return s;
+})();
+
+var VDX=[0,0,0,-1,1], VDY=[0,-1,1,0,0];
+
+// ---------- 工具 ----------
 function hexToBytes(hex){
 	var out=new Uint8Array(hex.length/2);
 	for(var i=0;i<out.length;i++){ out[i]=parseInt(hex.substr(i*2,2),16); }
 	return out;
 }
-
-// ---------- 确定性游戏对象 ----------
-function GameObject(conv){
-	this.conv=conv;
-	// 所有玩家统一起点 x，按 conv 分行排布：
-	// 旧公式按 conv 错开 x，靠近右侧墙的玩家会更早停下，看起来像“P2 移动距离比 P1 少”。
-	this.x=(WIDTH/4-BOX_SIZE)/2;
-	this.y=40+((conv-1)%8)*(BOX_SIZE+18);
-	this.dir=DIRECTION.STOP;
-	this.speed=80;
+function clamp(v,lo,hi){ return v<lo?lo:(v>hi?hi:v); }
+function rectsOverlap(ax,ay,aw,ah,bx,by,bw,bh){
+	return ax<bx+bw && ax+aw>bx && ay<by+bh && ay+ah>by;
 }
-GameObject.prototype.move=function(dtMs){
-	var dt=dtMs/1000;
-	if(this.dir===DIRECTION.UP)this.y-=this.speed*dt;
-	else if(this.dir===DIRECTION.DOWN)this.y+=this.speed*dt;
-	else if(this.dir===DIRECTION.LEFT)this.x-=this.speed*dt;
-	else if(this.dir===DIRECTION.RIGHT)this.x+=this.speed*dt;
-	if(this.x<0)this.x=0; if(this.x>WIDTH-BOX_SIZE)this.x=WIDTH-BOX_SIZE;
-	if(this.y<0)this.y=0; if(this.y>HEIGHT-BOX_SIZE)this.y=HEIGHT-BOX_SIZE;
-};
+// 确定性伪随机（mulberry32）：由 (seed,conv,counter) 派生，全员一致
+function seededRand(a){
+	a=(a>>>0);
+	a=Math.imul(a^(a>>>15), a|1);
+	a^=a+Math.imul(a^(a>>>7), a|61);
+	return ((a^(a>>>14))>>>0)/4294967296;
+}
+
+// ---------- 坦克（确定性游戏对象）----------
+function Tank(conv, slotIdx, lives){
+	this.conv=conv;
+	this.slot=slotIdx;
+	this.x=SLOT_POS[slotIdx%SLOT_POS.length].x;
+	this.y=SLOT_POS[slotIdx%SLOT_POS.length].y;
+	this.dir=DIRECTION.STOP;
+	this.face=DIRECTION.UP;            // 炮管朝向（最后有效方向）
+	this.speed=90;
+	this.lives=lives;         // 剩余命：一次中弹=死一条命；0=淘汰不再复活
+	this.livesMax=lives;
+	this.alive=true;
+	this.kills=0;
+	this.deathFrames=0;                // 死亡后复活倒计时（帧）
+	this.respawnCount=0;               // 已复活次数（喂 RNG）
+	this.lastFire=0;                   // 上帧开火位（边沿检测）
+	this.cdFrames=0;                   // 射击冷却（帧）
+}
+
+// ---------- 世界常量（由 stepMs 换算成"帧数"，保证确定性）----------
+var RESPAWN_MS=2000, SHOT_CD_MS=400, BULLET_SPEED=300, BULLET_SIZE=6;
 
 // ============================================================
 // Client —— 对应 kfs_client_core.c（每标签页 = 一个真实客户端）
 // ============================================================
-function Client(wsUrl, roomId, conv, token, heartbeatMs, stepMs){
+function Client(wsUrl, roomId, conv, token, heartbeatMs, stepMs, lives){
 	this.wsUrl=wsUrl; this.roomId=roomId; this.conv=conv; this.token=token;
-	this.heartbeatMs=heartbeatMs; this.stepMs=stepMs;
+	this.heartbeatMs=heartbeatMs; this.stepMs=stepMs; this.lives=lives||3;
+	this.respawnFrames=Math.max(1, Math.round(RESPAWN_MS/this.stepMs));
+	this.cdFrames=Math.max(1, Math.round(SHOT_CD_MS/this.stepMs));
 	this.ws=null;
-	this.joined=false;      // 已收到服务器 JOIN 应答
-	this.joinOk=false;      // JOIN 是否成功
-	this.result=-1;
-	this.state={};          // 本地确定性状态 conv -> GameObject
-	this.recvQueue=[];      // 收到的广播帧（未消化）
+	this.joined=false; this.joinOk=false; this.result=-1;
+	this.state={};            // conv -> Tank
+	this.bullets=[];          // {owner,x,y,vx,vy}
+	this.players=[];          // 本帧全员输入 [{conv,dir,fire}]
+	this.sortedConvs=[];      // 稳定玩家序（决定 slot / p1..p32）
+	this.roomSeed=0;          // 服务器锚定的房间种子（重连时补）
+	this.recvQueue=[];
 	this.currentDir=DIRECTION.STOP;
-	this.nextFid=0;         // 裁决帧号（服务器已广播的最小公共帧）
-	this.sendFid=-1;        // 已发出的最高目标帧
-	this.advanceFrames=2;   // 输入提前量窗口（对齐 config advance_frames）
-	this.lastBfid=-1;
-	this.lastBroadcastAt=0;   // 最近一次收到服务器广播的时间戳（用于判断是否在推帧）
-	this.readyAt=0;           // JOIN 成功/READY 的时间（用于“迟迟没有广播”提示）
-	this.noFrameWarned=false;
-	this.lastVerify="";
-	this.logs=[];
-	this._dropped=false;    // 模拟掉线开关
-	this.readySent=false;
+	this.currentFire=0;
+	this.nextFid=0; this.sendFid=-1; this.advanceFrames=2;
+	this.lastBfid=-1; this.lastBroadcastAt=0;
+	this.readyAt=0; this.noFrameWarned=false; this.lastVerify="";
+	this.logs=[]; this._dropped=false; this.readySent=false;
+	this.gameOver=false; this.winnerConv=0;
 }
 Client.prototype.log=function(s){ this.logs.unshift(s); if(this.logs.length>40)this.logs.pop(); renderStatus(); };
 
@@ -123,13 +162,12 @@ Client.prototype.close=function(){
 
 // ---------- 网关消息处理 ----------
 Client.prototype.onMsg=function(msg){
-	var self=this;
 	switch(msg.op){
 		case "joined":
 			this.joined=true; this.joinOk=msg.ok; this.result=msg.result;
+			if(typeof msg.room_seed==="number") this.roomSeed=msg.room_seed>>>0;
 			if(msg.ok){
 				this.log("JOIN 成功 result=0，发送 READY 就绪...");
-				if(!this.state[this.conv]) this.state[this.conv]=new GameObject(this.conv);
 				this.sendReady();
 				this.readyAt=Date.now(); this.noFrameWarned=false;
 				setConnStatus("✅ JOIN 成功，已上报 READY，等待服务器广播...", "ok");
@@ -148,14 +186,13 @@ Client.prototype.onMsg=function(msg){
 		case "broadcast":
 			this.onBroadcast(msg);
 			break;
-		case "log":
-			this.log("[网关] "+msg.msg);
+		case "rejoin_sync":
+			this.roomSeed=msg.room_seed>>>0;
+			this.log("收到重连锚点 seed="+this.roomSeed+" collect_fid="+msg.collect_fid);
 			break;
-		case "error":
-			this.log("[网关错误] "+msg.msg);
-			break;
-		case "pong":
-			break;
+		case "log":  this.log("[网关] "+msg.msg); break;
+		case "error":this.log("[网关错误] "+msg.msg); break;
+		case "pong": break;
 	}
 };
 
@@ -164,50 +201,47 @@ Client.prototype.sendReady=function(){
 	if(!this.joinOk) return;
 	this.send({op:"ready"});
 	this.readySent=true;
-	this.log("已上报 READY（等待 server.lua room:start() 开始推帧）");
+	this.log("已上报 READY（等待 server.lua 开始推帧）");
 };
-// 输入提前量：把输入补发到 next_fid + advance_frames（对齐 client.lua topup）
 Client.prototype.topup=function(){
 	if(!this.joinOk) return;
+	if(this.gameOver) return;           // 剩一人：停止发包
 	var target=this.nextFid+this.advanceFrames;
-	// 关键：新客户端第一次收到很高的 frame_id（房间已经推了很久）时，
-	// sendFid 还停在 0..2。不要从旧帧开始补发几千帧——服务器只接受
-	// collecting_fid 附近 8 帧，补发旧帧会堵塞 KCP，当前方向输入迟迟到不了。
-	if(this.sendFid < this.nextFid - 1){
-		this.sendFid=this.nextFid-1;
-	}
+	if(this.sendFid < this.nextFid - 1){ this.sendFid=this.nextFid-1; }
 	while(this.sendFid<target){
 		this.sendFid++;
 		if(this.sendFid>=0){
-			this.send({op:"input", fid:this.sendFid, data:this.dirToHex(this.currentDir)});
+			this.send({op:"input", fid:this.sendFid, data:this.inputToHex(this.myInput())});
 		}
 	}
 };
-// 输入编码：发送 ASCII 数字 '0'..'4'（0x30..0x34），与 server.lua / client.lua
-// 的文本输入格式一致。之前发的是二进制 0x00..0x04，广播回来
-// String.fromCharCode(0x01) 不是可 parseInt 的数字，方向永远被当成 STOP。
-Client.prototype.dirToHex=function(d){
-	var code=0x30 + (Number(d)&0x0f);
-	return ("0"+code.toString(16)).slice(-2);
+// 本端只给"自己 conv"注入本机输入；视角切到别人时本端不再代发输入
+Client.prototype.myInput=function(){
+	return {dir:this.currentDir, fire:this.currentFire};
+};
+// 2 字节 ASCII 编码：[dir '0'..'4'][fire '0'/'1']
+Client.prototype.inputToHex=function(inp){
+	var d=0x30 + (Number(inp.dir)&0x0f);
+	var f=0x30 + (inp.fire?1:0);
+	return ("0"+d.toString(16)).slice(-2) + ("0"+f.toString(16)).slice(-2);
 };
 Client.prototype.reportState=function(fid, payloadBytes){
-	// 对齐 client.lua：h=(h*31+byte)%2^32，对完整广播负载（含尾 4B 对账哈希）
 	var h=0;
 	for(var i=0;i<payloadBytes.length;i++){ h=(h*31+payloadBytes[i])%4294967296; }
 	this.send({op:"state", fid:fid, hash:h>>>0});
 };
 
-// ---------- 广播帧处理 ----------
+// ---------- 广播帧处理 + 确定性世界推进 ----------
 Client.prototype.onBroadcast=function(msg){
 	var fid=msg.fid, ok=msg.ok;
 	var first=!this.lastBroadcastAt;
 	this.lastBroadcastAt=Date.now();
 	if(first){
 		setConnStatus("🎮 已收到服务器广播 fid="+fid+"，帧同步运行中", "ok");
-		showTips("已收到服务器广播 fid="+fid+"，帧同步运行中");
+		showTips("已收到服务器广播 fid="+fid+"，坦克对战帧同步运行中");
 	}
 	var payload=hexToBytes(msg.payload);
-	// 解析逐玩家 [conv 4B][len 2B][data]；末尾 4B 为服务器对账哈希（跳过）
+	// 逐玩家 [conv 4B][len 2B][data]；末尾 4B 对账哈希（跳过）
 	var players=[], off=0, bodyLen=payload.length-4;
 	if(bodyLen>=6){
 		while(off+6<=bodyLen){
@@ -218,40 +252,182 @@ Client.prototype.onBroadcast=function(msg){
 			players.push({conv:conv, data:data});
 		}
 	}
-	var brief=[];
-	for(var i=0;i<players.length;i++){ brief.push("c"+players[i].conv+":"+String.fromCharCode.apply(null,players[i].data)); }
-	this.log("收到广播 fid="+fid+" 玩家数="+players.length+" 对账="+(ok?"一致":"不一致!!")+" ["+brief.join(" ")+"]");
 	this.lastBfid=fid;
 	this.lastVerify=ok?("帧"+fid+" 服务器对账哈希一致"):("!! 帧"+fid+" 服务器对账哈希不一致 DESYNC !!");
 	if(!ok){ this.log("!! 帧 "+fid+" 对账不一致（输入哈希不同，服务器侧判不同步）"); }
 
-	// 本地确定性状态推进：应用该帧全员输入（data 即方向数字字符串）
+	// 解码本帧全员输入（2 字节）
+	var frameInputs=[];
 	for(var j=0;j<players.length;j++){
-		var p=players[j];
-		if(p.data.length>0){
-			if(!this.state[p.conv]) this.state[p.conv]=new GameObject(p.conv);
-			var d=parseInt(String.fromCharCode.apply(null,p.data),10);
-			this.state[p.conv].dir=isNaN(d)?DIRECTION.STOP:d;
-			this.state[p.conv].move(this.stepMs);
-		}
+		var p=players[j], dir=DIRECTION.STOP, fire=0;
+		if(p.data.length>=1) dir=clamp(p.data[0]-0x30,0,4);
+		if(p.data.length>=2) fire=(p.data[1]-0x30)?1:0;
+		frameInputs.push({conv:p.conv, dir:dir, fire:fire});
 	}
-	// 上报状态哈希（对账）
-	this.reportState(fid, payload);
+	this.ensurePlayers(frameInputs);
+	this.stepWorld(frameInputs);
+	if(!this.gameOver) this.reportState(fid, payload);
+
 	this.recvQueue.push(fid);
-	// 裁决帧号推进：本客户端已收到该帧 → 可补发下一批输入（锁步由服务器裁决）
 	if(fid+1>this.nextFid){ this.nextFid=fid+1; this.topup(); }
 	renderStatus();
 };
 
-// 按帧消化（返回是否有可消化帧）
-Client.prototype.stepForward=function(){
-	return this.recvQueue.length>0;
+// 玩家集合（按 conv 升序）→ 稳定 slot（p1=slot0..p32）
+Client.prototype.ensurePlayers=function(frameInputs){
+	var seen={}, i;
+	for(i=0;i<frameInputs.length;i++) seen[frameInputs[i].conv]=1;
+	if(!seen[this.conv]) seen[this.conv]=1;         // 保证自己始终在集合里
+	var list=[]; for(var k in seen) list.push(Number(k));
+	list.sort(function(a,b){return a-b;});
+	var changed=list.length!==this.sortedConvs.length;
+	for(i=0;i<list.length && !changed;i++){ if(list[i]!==this.sortedConvs[i]) changed=true; }
+	this.sortedConvs=list;
+	if(changed){
+		for(i=0;i<list.length;i++){
+			var conv=list[i];
+			if(!this.state[conv]) this.state[conv]=new Tank(conv, this.freeSlot(), this.lives);
+		}
+		this.log("玩家就位："+list.map(function(c,ix){return "P"+(ix+1)+"=c"+c;}).join(" "));
+	}
+};
+Client.prototype.slotOf=function(conv){
+	var i=this.sortedConvs.indexOf(conv);
+	return i<0?(conv%SLOT_POS.length):i;
+};
+// 最低空闲槽（确定性：各端按相同状态与相同创建顺序算出相同结果）
+Client.prototype.freeSlot=function(){
+	var used={}, k, s;
+	for(k in this.state){ if(this.state[k]) used[this.state[k].slot]=1; }
+	for(s=0;s<SLOT_POS.length;s++){ if(!used[s]) return s; }
+	return 0;
+};
+
+// 单帧确定性推进
+Client.prototype.stepWorld=function(frameInputs){
+	var dt=this.stepMs/1000, i, inp, t;
+
+	// 1) 应用全员输入
+	for(i=0;i<frameInputs.length;i++){
+		inp=frameInputs[i]; t=this.state[inp.conv];
+		if(!t) continue;
+		t.dir=inp.dir;
+		if(inp.dir!==DIRECTION.STOP) t.face=inp.dir;
+		if(!t.alive) { t.lastFire=inp.fire; continue; }
+		if(inp.fire===1 && t.lastFire===0 && t.cdFrames<=0){
+			this.spawnBullet(t);
+			t.cdFrames=this.cdFrames;
+		}
+		t.lastFire=inp.fire;
+	}
+	// 2) 移动坦克（避障）
+	for(i=0;i<this.sortedConvs.length;i++){
+		t=this.state[this.sortedConvs[i]];
+		if(!t||!t.alive) continue;
+		this.moveTank(t, dt);
+		if(t.cdFrames>0) t.cdFrames--;
+	}
+	// 3) 子弹推进 + 碰撞
+	this.stepBullets(dt);
+	// 4) 复活倒计时（命耗尽的淘汰者不参与）
+	for(i=0;i<this.sortedConvs.length;i++){
+		t=this.state[this.sortedConvs[i]];
+		if(!t||t.alive||t.lives<=0) continue;
+		if(--t.deathFrames<=0) this.respawn(t);
+	}
+	// 5) 胜负判定：房内≥2人且仅剩1人仍有命（其余全部淘汰）→ 停发包
+	//    注意：死亡等待复活的玩家仍有命，不算淘汰，避免 2s 复活窗口内误判
+	var inGameN=0;
+	for(i=0;i<this.sortedConvs.length;i++){ if(this.state[this.sortedConvs[i]].lives>0) inGameN++; }
+	if(this.sortedConvs.length>=2 && inGameN<=1 && !this.gameOver){
+		this.gameOver=true;
+		this.winnerConv=0;
+		for(i=0;i<this.sortedConvs.length;i++){ if(this.state[this.sortedConvs[i]].lives>0){ this.winnerConv=this.sortedConvs[i]; } }
+		this.log("★ 仅剩 1 名存活玩家（P"+(this.sortedConvs.indexOf(this.winnerConv)+1)+"=c"+this.winnerConv+"），胜负已分，停止发包");
+		showTips("胜者：P"+(this.sortedConvs.indexOf(this.winnerConv)+1)+"（conv="+this.winnerConv+"）");
+	}
+};
+
+Client.prototype.moveTank=function(t, dt){
+	if(t.dir===DIRECTION.STOP) return;
+	var nx=clamp(t.x+VDX[t.dir]*t.speed*dt,0,WIDTH-BOX_SIZE);
+	var ny=clamp(t.y+VDY[t.dir]*t.speed*dt,0,HEIGHT-BOX_SIZE);
+	if(!this.hitBarrier(nx,t.y,BOX_SIZE,BOX_SIZE)) t.x=nx;
+	if(!this.hitBarrier(t.x,ny,BOX_SIZE,BOX_SIZE)) t.y=ny;
+};
+Client.prototype.hitBarrier=function(x,y,w,h){
+	for(var i=0;i<BARRIERS.length;i++){
+		var b=BARRIERS[i];
+		if(rectsOverlap(x,y,w,h,b.x,b.y,b.w,b.h)) return true;
+	}
+	return false;
+};
+Client.prototype.spawnBullet=function(t){
+	var cx=t.x+BOX_SIZE/2, cy=t.y+BOX_SIZE/2;
+	var vx=VDX[t.face], vy=VDY[t.face];
+	if(vx===0&&vy===0){ vx=0; vy=-1; }        // STOP 时用当前朝向（face 已保证非 STOP 语义）
+	var off=BOX_SIZE/2+2;
+	this.bullets.push({owner:t.conv, x:cx+vx*off, y:cy+vy*off, vx:vx, vy:vy});
+};
+Client.prototype.stepBullets=function(dt){
+	var move=BULLET_SPEED*dt, out=[], i, j, b, t;
+	for(i=0;i<this.bullets.length;i++){
+		b=this.bullets[i];
+		b.x+=b.vx*move; b.y+=b.vy*move;
+		if(b.x<0||b.x>WIDTH||b.y<0||b.y>HEIGHT) continue;               // 越界消失
+		if(this.hitBarrier(b.x,b.y,BULLET_SIZE,BULLET_SIZE)) continue;   // 撞墙消失
+		var hit=false;
+		for(j=0;j<this.sortedConvs.length;j++){
+			t=this.state[this.sortedConvs[j]];
+			if(!t||!t.alive||t.conv===b.owner) continue;                 // 自伤关闭：跳过 owner
+			if(rectsOverlap(b.x,b.y,BULLET_SIZE,BULLET_SIZE,t.x,t.y,BOX_SIZE,BOX_SIZE)){
+				this.damage(t, b.owner); hit=true; break;
+			}
+		}
+		if(!hit) out.push(b);
+	}
+	this.bullets=out;
+};
+Client.prototype.damage=function(target, killerConv){
+	var killer=this.state[killerConv];
+	if(killer) killer.kills++;
+	target.alive=false;
+	target.lives--;
+	if(target.lives<=0){
+		target.lives=0;
+		target.deathFrames=0;                           // 命耗尽：淘汰，不再复活
+		this.log("☠ P"+(this.sortedConvs.indexOf(target.conv)+1)+"(c"+target.conv+") 被 P"+(this.sortedConvs.indexOf(killerConv)+1)+"(c"+killerConv+") 击杀，命耗尽淘汰（击杀者累计"+killer.kills+"杀）");
+	}else{
+		target.deathFrames=this.respawnFrames;          // 2s 后复活（按帧）
+		this.log("☠ P"+(this.sortedConvs.indexOf(target.conv)+1)+"(c"+target.conv+") 被 P"+(this.sortedConvs.indexOf(killerConv)+1)+"(c"+killerConv+") 击杀，剩 "+target.lives+" 命（击杀者累计"+killer.kills+"杀）");
+	}
+};
+Client.prototype.respawn=function(t){
+	if(t.lives<=0) return;                              // 淘汰：不复活
+	// 确定性随机空闲槽：由 (room_seed, conv, respawnCount) 派生，避开存活玩家占用的槽
+	var base=Math.floor(seededRand((this.roomSeed ^ Math.imul(t.conv,2654435761) ^ Math.imul(t.respawnCount+1,40503))>>>0)*SLOT_POS.length);
+	var idx=-1, k, i, occ;
+	for(k=0;k<SLOT_POS.length;k++){
+		i=(base+k)%SLOT_POS.length;
+		occ=false;
+		for(var c=0;c<this.sortedConvs.length;c++){
+			var o=this.state[this.sortedConvs[c]];
+			if(o&&o.alive&&o.slot===i){ occ=true; break; }
+		}
+		if(!occ){ idx=i; break; }
+	}
+	if(idx<0) idx=base;
+	t.respawnCount++;
+	t.slot=idx;
+	t.x=SLOT_POS[idx].x; t.y=SLOT_POS[idx].y;
+	t.alive=true; t.dir=DIRECTION.STOP; t.cdFrames=0;
+	this.log("↑ P"+(this.sortedConvs.indexOf(t.conv)+1)+"(c"+t.conv+") 复活于槽"+idx);
 };
 
 // ============================================================
 // 主控与 UI
 // ============================================================
-var client=null, viewConv=1, ctx=null;
+var client=null, viewIdx=0, ctx=null;
 
 function setConnStatus(text, kind){
 	var el=$("#conn_status");
@@ -259,10 +435,8 @@ function setConnStatus(text, kind){
 	el.removeClass("ok err warn info").addClass(kind||"info").text(text);
 }
 
-// 从网关读取容器内当前 tokens_<room>.txt（网关侧 docker exec 读取）
-// 解决“server.lua 每次重启 token 都变、手动抄旧 token 导致 JOIN result=5”的问题。
 function fetchTokens(onDone, silent){
-	var wsUrl=$("#ws_url").val().trim()||"ws://127.0.0.1:18080";
+	var wsUrl=$("#ws_url").val().trim()||"ws://127.0.0.1:8081";
 	var roomId=parseInt($("#room_id").val(),10); if(isNaN(roomId)) roomId=1;
 	var wantConv=parseInt($("#conv").val(),10); if(isNaN(wantConv)) wantConv=101;
 	var ws, done=false;
@@ -275,25 +449,14 @@ function fetchTokens(onDone, silent){
 		finish(null);
 	},6000);
 	try{ ws=new WebSocket(wsUrl); }
-	catch(e){
-		clearTimeout(timer);
-		if(!silent) showTips("网关地址无效: "+wsUrl);
-		finish(null);
-		return;
-	}
+	catch(e){ clearTimeout(timer); if(!silent) showTips("网关地址无效: "+wsUrl); finish(null); return; }
 	ws.onopen=function(){ ws.send(JSON.stringify({op:"tokens", room_id:roomId})); };
 	ws.onmessage=function(ev){
 		var m; try{ m=JSON.parse(ev.data); }catch(e){ return; }
 		if(m.op!=="tokens" || done) return;
 		done=true; clearTimeout(timer); try{ ws.close(); }catch(e){}
-		if(m.error){
-			if(!silent) showTips("读取 token 失败: "+m.error);
-			finish(null); return;
-		}
-		if(!m.tokens || !m.tokens.length){
-			if(!silent) showTips("房间 "+roomId+" 没有 token 文件，确认 server.lua 已启动");
-			finish(null); return;
-		}
+		if(m.error){ if(!silent) showTips("读取 token 失败: "+m.error); finish(null); return; }
+		if(!m.tokens || !m.tokens.length){ if(!silent) showTips("房间 "+roomId+" 没有 token 文件，确认 server.lua 已启动"); finish(null); return; }
 		var hit=null;
 		for(var i=0;i<m.tokens.length;i++){ if(m.tokens[i].conv===wantConv){ hit=m.tokens[i]; break; } }
 		if(!hit) hit=m.tokens[0];
@@ -301,10 +464,7 @@ function fetchTokens(onDone, silent){
 		$("#token").val(hit.token);
 		var fr=Number(m.frame_rate||0);
 		var stepMs=0;
-		if(fr>0){
-			stepMs=Math.round(1000/fr);
-			$("#step_ms").val(stepMs);
-		}
+		if(fr>0){ stepMs=Math.round(1000/fr); $("#step_ms").val(stepMs); }
 		if(!silent){
 			showTips("已填入 conv="+hit.conv+" token="+hit.token+
 				(stepMs?("；按 frame_rate="+fr+" 设帧间隔 "+stepMs+"ms"):"")+
@@ -315,23 +475,19 @@ function fetchTokens(onDone, silent){
 	ws.onerror=function(){
 		if(done) return;
 		done=true; clearTimeout(timer);
-		if(!silent) showTips("读取 token 失败：连不上网关 "+wsUrl+"（18080=容器内网关，需先在容器执行 kfs-gateway/start_container.sh；8081=本机 node gateway.js）");
+		if(!silent) showTips("读取 token 失败：连不上网关 "+wsUrl+"（18080=容器内网关；8081=本机 node gateway.js）");
 		finish(null);
 	};
 }
+function fetchTokensClick(){ fetchTokens(null, false); }
 
-function fetchTokensClick(){
-	fetchTokens(null, false);
-}
-
-// 返回登录（由 index.html 的 inline onclick 调用，不依赖 jQuery ready 绑定）
 function backToLogin(){
 	if(client){
-		client._suppressStatus=true;
-		client._dropped=true;
+		client._suppressStatus=true; client._dropped=true;
 		if(client.ws){ try{ client.ws.close(); }catch(e){} }
 		client=null;
 	}
+	viewIdx=0;
 	$("#content").hide(); $("#login").show();
 	$("#reconnect_btn").hide();
 	setConnStatus("未连接", "info");
@@ -339,9 +495,8 @@ function backToLogin(){
 }
 
 function startClient(){
-	var wsUrl=$("#ws_url").val().trim()||"ws://127.0.0.1:18080";
-	// 防混淆：10500 是服务器 UDP 端口（网关去连的），浏览器只连网关 WebSocket 18080（或本机网关 8081）
-	if(wsUrl.indexOf(":10500")>=0 || wsUrl.indexOf(":10500/")>=0){
+	var wsUrl=$("#ws_url").val().trim()||"ws://127.0.0.1:cc";
+	if(wsUrl.indexOf(":10500")>=0){
 		showTips("网关地址填错了：10500 是服务器 UDP 端口，浏览器要连网关 WebSocket 18080（本机网关则 8081）");
 		return;
 	}
@@ -350,68 +505,106 @@ function startClient(){
 	var tokenText=$("#token").val().trim();
 	var token=parseInt(tokenText,10); if(isNaN(token)) token=0;
 	var heartbeatMs=parseInt($("#heartbeat_ms").val(),10); if(isNaN(heartbeatMs)||heartbeatMs<0) heartbeatMs=500;
-	var stepMs=parseInt($("#step_ms").val(),10); if(isNaN(stepMs)||stepMs<10) stepMs=1000;
+	var stepMs=parseInt($("#step_ms").val(),10); if(isNaN(stepMs)||stepMs<10) stepMs=100;
+	var lives=parseInt($("#lives").val(),10); if(isNaN(lives)||lives<1) lives=3; if(lives>9) lives=9;
 
-	// token 为空：先自动读取当前 token，再自动继续连接，点②就能直接进
 	if(tokenText===""){
 		setConnStatus("⏳ token 为空，正在读取当前 token...", "info");
 		showTips("token 为空，正在自动读取当前 token...");
-		fetchTokens(function(hit){
-			if(!hit){
-				showTips("读取 token 失败：确认网关 "+wsUrl+" 和 server.lua 已启动");
-				setConnStatus("❌ 读取 token 失败：确认网关 "+wsUrl+" 和 server.lua 已启动", "err");
-				return;
-			}
-			startClient();
-		}, true);
+		fetchTokens(function(){ startClient(); }, true);
 		return;
 	}
 
-	// 重连/重新开始时先静默关掉旧客户端，避免旧 onclose 覆盖新状态条
 	if(client){
 		client._suppressStatus=true;
 		if(client.ws){ try{ client.ws.close(); }catch(e){} }
 		client=null;
 	}
-
+	viewIdx=0;
 	setConnStatus("⏳ 正在连接网关 "+wsUrl+" ...", "info");
 	showTips("正在连接网关 "+wsUrl+" ...");
 	$("#login").hide(); $("#content").show();
 
-	client=new Client(wsUrl, roomId, conv, token, heartbeatMs, stepMs);
-	client.log("启动客户端 conv="+conv+" room_id="+roomId+" token="+token);
+	client=new Client(wsUrl, roomId, conv, token, heartbeatMs, stepMs, lives);
+	client.log("启动客户端 conv="+conv+" room_id="+roomId+" token="+token+" lives="+lives);
 	client.connect();
 	renderStatus();
 }
 
-// 渲染：绘制"当前视角客户端"看到的确定性状态
+// ---------- 渲染 ----------
 function render(){
+	if(!ctx) return;
 	ctx.clearRect(0,0,WIDTH,HEIGHT);
+	ctx.fillStyle="#20242a"; ctx.fillRect(0,0,WIDTH,HEIGHT);
+	for(var i=0;i<BARRIERS.length;i++){
+		var b=BARRIERS[i];
+		ctx.fillStyle="#556"; ctx.fillRect(b.x,b.y,b.w,b.h);
+		ctx.strokeStyle="#778"; ctx.strokeRect(b.x+0.5,b.y+0.5,b.w-1,b.h-1);
+	}
 	var state=(client&&client.state)?client.state:{};
-	var keys=Object.keys(state).sort();
-	for(var i=0;i<keys.length;i++){
-		var obj=state[keys[i]];
-		ctx.fillStyle=COLORS[(obj.conv-1)%COLORS.length];
-		ctx.fillRect(obj.x,obj.y,BOX_SIZE,BOX_SIZE);
-		ctx.font="13px Courier New"; ctx.fillStyle="#fff";
-		ctx.fillText("C"+obj.conv,obj.x+1,obj.y+BOX_SIZE-6);
+	var convs=(client&&client.sortedConvs)?client.sortedConvs:Object.keys(state).map(Number);
+	if(client){
+		ctx.fillStyle="#f6e58d";
+		for(var k=0;k<client.bullets.length;k++){
+			var bl=client.bullets[k]; ctx.fillRect(bl.x-BULLET_SIZE/2,bl.y-BULLET_SIZE/2,BULLET_SIZE,BULLET_SIZE);
+		}
+	}
+	for(var j=0;j<convs.length;j++){
+		var t=state[convs[j]]; if(!t) continue;
+		if(!t.alive){
+			ctx.strokeStyle="rgba(255,255,255,.25)";
+			ctx.strokeRect(t.x+0.5,t.y+0.5,BOX_SIZE-1,BOX_SIZE-1);   // 死亡占位
+			continue;
+		}
+		var col=COLORS[j%COLORS.length];
+		var isView=(client&&j===viewIdx);
+		ctx.fillStyle="#333";
+		ctx.fillRect(t.x,t.y+2,BOX_SIZE,4); ctx.fillRect(t.x,t.y+BOX_SIZE-6,BOX_SIZE,4);
+		ctx.fillStyle=col; ctx.fillRect(t.x+3,t.y+6,BOX_SIZE-6,BOX_SIZE-12);
+		// 炮管
+		var cx=t.x+BOX_SIZE/2, cy=t.y+BOX_SIZE/2, L=BOX_SIZE*0.7;
+		ctx.strokeStyle=col; ctx.lineWidth=3;
+		ctx.beginPath(); ctx.moveTo(cx,cy); ctx.lineTo(cx+VDX[t.face]*L, cy+VDY[t.face]*L); ctx.stroke();
+		ctx.lineWidth=1;
+		if(isView){ ctx.strokeStyle="#fff"; ctx.strokeRect(t.x-1,t.y-1,BOX_SIZE+2,BOX_SIZE+2); }
+		ctx.font="11px Courier New"; ctx.fillStyle="#fff";
+		ctx.fillText("P"+(j+1), t.x, t.y-3);
+		for(var h=0;h<t.livesMax;h++){
+			ctx.fillStyle=(h<t.lives)?"#2ecc71":"#444";
+			ctx.fillRect(t.x+h*6, t.y+BOX_SIZE+2, 5, 3);
+		}
+		if(t.kills>0){ ctx.fillStyle="#f6e58d"; ctx.fillText(t.kills+"K", t.x+BOX_SIZE-10, t.y+BOX_SIZE+10); }
+	}
+	if(client&&client.gameOver){
+		ctx.fillStyle="rgba(0,0,0,.55)"; ctx.fillRect(0,HEIGHT/2-30,WIDTH,60);
+		ctx.fillStyle="#fff"; ctx.font="20px Courier New"; ctx.textAlign="center";
+		ctx.fillText("胜者 P"+(convs.indexOf(client.winnerConv)+1)+"  ·  已停止发包", WIDTH/2, HEIGHT/2+6);
+		ctx.textAlign="left";
 	}
 }
 function renderStatus(){
 	if(!client){ $("#status").text(""); return; }
-	var s="conv="+client.conv+" | room="+client.roomId+" | token="+client.token;
+	var s="conv="+client.conv+" | room="+client.roomId+" | token="+client.token+" | lives="+client.lives;
 	s+="\n连接: "+(client.ws?(client.ws.readyState===1?"已连接":"连接中/断开"):"未连接");
 	s+=" | JOIN: "+(client.joinOk?"成功":(client.result===-1?"超时":"未成功(result="+client.result+")"));
 	s+=" | 就绪: "+(client.readySent?"已上报":"未上报");
-	s+=" | 裁决帧: "+client.nextFid+" | 已发至: "+client.sendFid+" | 最近广播: "+client.lastBfid+"\n";
+	s+=" | 裁决帧: "+client.nextFid+" | 已发至: "+client.sendFid+" | 最近广播: "+client.lastBfid;
+	s+=" | "+(client.gameOver?("★ 胜负已分(停止发包)"):("在场"+aliveCount()+"/"+client.sortedConvs.length))+"\n";
 	var pushHint = client.lastBroadcastAt ? (Math.round((Date.now()-client.lastBroadcastAt)/100)/10+"s前") : "尚未收到";
-	s+="服务器推帧: "+pushHint+(client.lastBroadcastAt && Date.now()-client.lastBroadcastAt>2000?"  ⚠ 超过2s未推帧（服务器没跑/没start/人没齐）":"")+"\n";
+	s+="服务器推帧: "+pushHint+(client.lastBroadcastAt && Date.now()-client.lastBroadcastAt>2000 && !client.gameOver ?"  ⚠ 超过2s未推帧（服务器没跑/没start/人没齐）":"")+"\n";
 	s+=client.lastVerify+"\n";
-	s+="--- 本地确定性状态 ---\n";
-	var keys=Object.keys(client.state).sort();
-	for(var i=0;i<keys.length;i++){ var o=client.state[keys[i]]; s+="C"+o.conv+" ("+Math.round(o.x)+","+Math.round(o.y)+") dir="+o.dir+"\n"; }
+	s+="--- 玩家状态 ---\n";
+	for(var i=0;i<client.sortedConvs.length;i++){
+		var o=client.state[client.sortedConvs[i]]; if(!o) continue;
+		s+=("P"+(i+1)+" c"+o.conv+(i===viewIdx?" *":"  ")+" 命"+o.lives+"/"+o.livesMax+" 杀"+o.kills+
+			(o.lives<=0?" 淘汰":(o.alive?" 活":" 死(复活中)"))+" ("+Math.round(o.x)+","+Math.round(o.y)+") dir="+o.dir+"\n");
+	}
 	s+="--- 最近日志 ---\n"+client.logs.slice(0,8).join("\n");
 	$("#status").text(s);
+}
+function aliveCount(){
+	if(!client) return 0;
+	var n=0; for(var i=0;i<client.sortedConvs.length;i++){ if(client.state[client.sortedConvs[i]].lives>0) n++; } return n;
 }
 
 $(function(){
@@ -419,42 +612,41 @@ $(function(){
 	ctx=canvas.getContext("2d");
 	$("#content").hide();
 
-	// 键盘：方向键设置当前视角客户端的操作并立即补发；数字键1..N切换视角
 	$("body").keydown(function(e){
 		if(!client) return;
-		if(e.keyCode>=49 && e.keyCode<=57){
-			var n=e.keyCode-48;
-			if(n>=1 && n<=8){
-				viewConv=n;
-				if(!client.state[n]) client.state[n]=new GameObject(n);
-				renderStatus();
-			}
+		if(e.keyCode>=49 && e.keyCode<=56){
+			viewIdx=e.keyCode-49;
+			if(viewIdx>=client.sortedConvs.length) viewIdx=Math.max(0,client.sortedConvs.length-1);
+			renderStatus();
+			return;
+		}
+		if(FIRE_KEYS[e.keyCode]){
+			e.preventDefault();
+			client.currentFire=1; client.topup(); renderStatus();
 			return;
 		}
 		var d=DIR_KEYS[e.keyCode];
 		if(d!==undefined){
-			e.preventDefault();   // 防止方向键滚动页面
+			e.preventDefault();
 			client.currentDir=d;
-			client.topup();   // 立即把新方向补发到当前窗口
+			client.topup();
 			renderStatus();
 		}
 	});
 	$("body").keyup(function(e){
+		if(!client) return;
+		if(FIRE_KEYS[e.keyCode]){ e.preventDefault(); client.currentFire=0; client.topup(); renderStatus(); return; }
 		var d=DIR_KEYS[e.keyCode];
-		if(d!==undefined && client){
+		if(d!==undefined){
 			e.preventDefault();
 			client.currentDir=DIRECTION.STOP;
 			client.topup();
 			renderStatus();
 		}
 	});
-	// ①/②/返回登录 由 index.html 的 inline onclick 调用：
-	// 即使 jQuery ready 绑定失败或 main.js 被旧缓存，点按钮也一定有反应。
 
-	// 改 conv 后自动重新读取该 conv 的 token（多人房第二个标签页切到 102 时很方便）
 	$("#conv").on("change", function(){ fetchTokens(null, false); });
 
-	// 页面打开后静默读取当前 token：网关/服务器已启动时，直接点②即可
 	setTimeout(function(){
 		if($("#token").val().trim()==="") {
 			fetchTokens(function(hit){
@@ -463,27 +655,22 @@ $(function(){
 		}
 	}, 600);
 
-	// 注入 DESYNC：偏移当前视角玩家本地位置 → 上报哈希与全员不同 → 服务器对账报 DESYNC
 	$("#desync_btn").click(function(){
 		if(!client) return;
-		var obj=client.state[viewConv];
+		var conv=client.sortedConvs[viewIdx], obj=client.state[conv];
 		if(!obj){ showTips("还没有该玩家状态"); return; }
 		obj.x+=5;
-		client.log("已向 C"+viewConv+" 本地状态注入偏移(x+5)→ 服务器对账应报 DESYNC");
+		client.log("已向 P"+(viewIdx+1)+"(c"+conv+") 注入偏移(x+5)→ 服务器对账应报 DESYNC");
 		showTips("已注入状态偏移(x+5)，服务器对账应报 DESYNC");
 	});
-	// 模拟掉线/重连：断开网关连接（服务器 idle_timeout 后判掉线，席位保留）
 	$("#drop_btn").click(function(){
 		if(!client) return;
 		if(client.ws && client.ws.readyState===1){
 			client.close();
 			$("#reconnect_btn").show();
 			showTips('已断开连接（模拟掉线），席位保留，点「重连」恢复');
-		}else{
-			showTips("当前已不在线");
-		}
+		}else{ showTips("当前已不在线"); }
 	});
-	// 重连（对应断线重连：重新 join 同 room/conv/token，席位保留）
 	$("#reconnect_btn").click(function(){
 		if(!client) return;
 		$("#reconnect_btn").hide();
@@ -491,26 +678,23 @@ $(function(){
 		client.connect();
 		showTips("正在重连（重新 JOIN，席位保留）");
 	});
-	// 错误 token 入房：另开一个临时客户端用错误 token 请求 JOIN，验证被服务器拒绝
 	$("#badtoken_btn").click(function(){
-		var wsUrl=$("#ws_url").val().trim()||"ws://127.0.0.1:18080";
+		var wsUrl=$("#ws_url").val().trim()||"ws://127.0.0.1:8081";
 		var roomId=parseInt($("#room_id").val(),10); if(isNaN(roomId)) roomId=100;
-		var bad=new Client(wsUrl, roomId, 99, 12345, 500, 1000);
+		var bad=new Client(wsUrl, roomId, 99, 12345, 500, 100, 3);
 		bad.log("用错误 token(12345) 请求 JOIN room="+roomId+" conv=99（验证服务器鉴权拒绝）");
 		bad.connect();
 		showTips("已用错误 token 请求 JOIN，服务器应回 result=5(token错误)");
 	});
 
-	// 帧循环：绘制 + 状态栏刷新
 	setInterval(function(){
 		if(client && client.joinOk){
-			client.topup();   // 保持输入窗口（键盘不操作时补 STOP 空操作包）
+			client.topup();
 			renderStatus();
-			// JOIN/READY 后迟迟没有广播：给出明确提示，而不是让 canvas 一直空着
 			if(!client.lastBroadcastAt && client.readyAt && !client.noFrameWarned &&
 			   Date.now()-client.readyAt>2500){
 				client.noFrameWarned=true;
-				setConnStatus("⚠ JOIN 成功，但 2.5s 没收到广播：检查 server.lua 是否已 start（单人房 1/1 应自动 start）", "warn");
+				setConnStatus("⚠ JOIN 成功，但 2.5s 没收到广播：检查 server.lua 是否已 start（单人房应自动 start）", "warn");
 			}
 		}
 		render();

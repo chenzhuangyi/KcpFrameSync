@@ -214,11 +214,8 @@ class Session {
           hint =
             `2s 内没有收到任何 UDP 回包：${target}/udp (${this.udpFamily || cfg.serverFamily}) 不可达。\n` +
             `      先确认 server.lua 在跑（容器内: pgrep -af 'lua server.lua'），且它监听的 udp_port 与网关目标端口一致。\n` +
-            (cfg.serverPort === 10500
-              ? `      当前目标是 10501：这是 bridge_windows.js 的 UDP 口，必须同时有 bridge_container.js 在容器内运行；\n` +
-                `      直连 Docker 服务器请把 KFS_SERVER_PORT 改回 10500（或看 lua_test/config 的 udp_port）。\n`
-              : `      网关在容器内时目标应是 127.0.0.1:${cfg.serverPort}；网关在 Windows 时先查 Docker 的 UDP 代理：\n` +
-                `      netstat -ano -p UDP | findstr :${cfg.serverPort}（没有输出就 docker restart ${cfg.dockerContainer}）。\n`) +
+            `      网关在容器内时目标应是 127.0.0.1:${cfg.serverPort}；网关在 Windows 时先查 Docker 的 UDP 代理：\n` +
+                `      netstat -ano -p UDP | findstr :${cfg.serverPort}（没有输出就 docker restart ${cfg.dockerContainer}）。\n` +
             `      端口可用 KFS_SERVER_PORT 覆盖；网关启动 banner 会打印实际目标端口。`;
         } else {
           hint =
@@ -285,6 +282,7 @@ class Session {
   // UDP 收到数据：先判裸握手应答，其余喂 KCP
   onUdp(buf) {
     this.udpRx++;
+    console.log(`[gw#${this.id}] 读取 onUdp `);
     // 字节序：服务器 memcpy 写 ACK（x86 小端），线上 magic 为小端，必须 readUInt32LE。
     if (buf.length >= 5 && buf.readUInt32LE(0) === KFS_HANDSHAKE_MAGIC) {
       const result = buf[4];

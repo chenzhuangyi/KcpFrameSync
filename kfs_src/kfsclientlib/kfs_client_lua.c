@@ -1,13 +1,63 @@
 //=====================================================================
-// kfs_client_lua.c — 客户端库 Lua 绑定层
-//   fs.new / setpeer / join / 输入·就绪·广播·状态·追帧 / 心跳 / 参数 / 生命周期
-//   底层逻辑见 kfs_client_core.c；结构定义见 kfs_client.h。
+// kfs_client_lua.c — 客户端库 Lua 绑定层（瘦绑定）
+//
+//   本层只做三件事：
+//     1. userdata 持有 kfs_client* 句柄（指针，非内联结构）；
+//     2. 参数检查与 Lua 值 <-> C 值映射；
+//     3. 把 ABI 状态码翻译回旧版 Lua 错误文案，保证兼容。
+//   驱动线程、解帧、对账、事件队列等全部逻辑在 kfs_client_core.c，
+//   经 kfs_client_api.h 调用 —— Unity/Go/Rust 绑定接的是同一 ABI。
+//
+//   对外方法（与旧版一致）：
+//     kfs.new(port[, conv]) → client | nil, err
+//     c:setpeer(ip, port)          c:join(room_id[, token])
+//     c:send_input(fid, data)      c:send_ready()
+//     c:recv_broadcast()           c:report_state(fid, hash)
+//     c:catch_up()                 c:set_heartbeat(ms)
+//     c:nodelay(..) c:wndsize(..) c:setmtu(..)
+//     c:closed()  c:close()
+//   新增（ABI 能力透传，旧脚本不感知）：
+//     c:join_start(room_id[, token])  c:join_check()
+//     c:frame_interval_ms()  c:room_seed()  c:server_time_offset_ms()
+//     c:start_fid()  c:pending_events()  kfs.version()
 //=====================================================================
-#include "kfs_client.h"
+#include "kfs_client_api.h"
+
+#include <string.h>
+
+#include <lua.h>
+#include <lauxlib.h>
+#include <lualib.h>
+
+//---------------------------------------------------------------------
+// userdata：一个指针槽。close() 后置 NULL，__gc 幂等。
+//---------------------------------------------------------------------
+typedef struct {
+    kfs_client *c;
+} kfs_udata;
 
 static kfs_client *check_client(lua_State *L, int idx)
 {
-    return (kfs_client *)luaL_checkudata(L, idx, "kfsclientlib");
+    kfs_udata *ud = (kfs_udata *)luaL_checkudata(L, idx, "kfsclientlib");
+    if (ud->c == NULL)
+        luaL_error(L, "error kfs_client_lua: client closed");
+    return ud->c;
+}
+
+// ABI 错误码 → 旧版运行时错误文案（send_* 路径）
+static void client_send_error(lua_State *L, int status)
+{
+    switch (status) {
+    case KFS_ERR_CLOSED:
+        luaL_error(L, "error kfs_client_lua: client closed");
+        break;
+    case KFS_ERR_NOT_JOINED:
+        luaL_error(L, "error kfs_client_lua: not joined, call join() first");
+        break;
+    default:
+        luaL_error(L, "error kfs_client_lua: send failed (%d)", status);
+        break;
+    }
 }
 
 //---------------------------------------------------------------------
@@ -15,6 +65,8 @@ static kfs_client *check_client(lua_State *L, int idx)
 //---------------------------------------------------------------------
 static int kfs_setpeer(lua_State *L);
 static int kfs_join(lua_State *L);
+static int kfs_join_start(lua_State *L);
+static int kfs_join_check(lua_State *L);
 static int kfs_send_input(lua_State *L);
 static int kfs_send_ready(lua_State *L);
 static int kfs_recv_broadcast(lua_State *L);
@@ -27,69 +79,55 @@ static int kfs_setmtu(lua_State *L);
 static int kfs_closed(lua_State *L);
 static int kfs_close(lua_State *L);
 static int kfs_gc(lua_State *L);
+static int kfs_frame_interval(lua_State *L);
+static int kfs_room_seed(lua_State *L);
+static int kfs_time_offset(lua_State *L);
+static int kfs_start_fid(lua_State *L);
+static int kfs_is_started(lua_State *L);
+static int kfs_pending_events(lua_State *L);
 
 static int kfs_new(lua_State *L)
 {
     lua_Integer port = luaL_checkinteger(L, 1);
     lua_Integer conv = luaL_optinteger(L, 2, 0);
-    kfs_client *c = (kfs_client *)lua_newuserdatauv(L, sizeof(kfs_client), 0);
+    const char *err = NULL;
+    kfs_client *c;
+    kfs_udata *ud;
 
-    memset(c, 0, sizeof(*c));
-    c->closed = 0;
-    c->conv = (uint32_t)(conv & 0xFFFFFFFFu);
-    pthread_mutex_init(&c->lock, NULL);
-
-    c->net = net_open((int)port);
-    if (c->net == NULL) {
-        pthread_mutex_destroy(&c->lock);
+    c = kfs_client_create((uint16_t)port, (uint32_t)(conv & 0xFFFFFFFFu), &err);
+    if (c == NULL) {
         lua_pushnil(L);
-        lua_pushstring(L, net_errmsg(NULL));
+        lua_pushstring(L, err ? err : "kfsclientlib: create failed");
         return 2;
     }
-    c->kcp = ikcp_create(c->conv, (void *)c);
-    if (c->kcp == NULL) {
-        net_close(c->net);
-        c->net = NULL;
-        pthread_mutex_destroy(&c->lock);
-        lua_pushnil(L);
-        lua_pushstring(L, "kfsclientlib: ikcp_create failed");
-        return 2;
-    }
-    ikcp_setoutput(c->kcp, kfs_c_output);
-    ikcp_nodelay(c->kcp, 1, 10, 2, 1);
 
-    // 启动驱动线程
-    c->drunning = 1;
-    c->djoined = 0;
-    if (pthread_create(&c->dthread, NULL, kfs_drive_thread, (void *)c) != 0) {
-        c->drunning = 0;
-        c->djoined = 1;
-        ikcp_release(c->kcp);
-        c->kcp = NULL;
-        net_close(c->net);
-        c->net = NULL;
-        pthread_mutex_destroy(&c->lock);
-        lua_pushnil(L);
-        lua_pushstring(L, "kfsclientlib: thread create failed");
-        return 2;
-    }
+    ud = (kfs_udata *)lua_newuserdatauv(L, sizeof(kfs_udata), 0);
+    ud->c = c;
 
     if (luaL_newmetatable(L, "kfsclientlib")) {
         static const luaL_Reg methods[] = {
-            { "setpeer",       kfs_setpeer       },
-            { "join",          kfs_join          },
-            { "send_input",    kfs_send_input    },
-            { "send_ready",    kfs_send_ready    },
-            { "recv_broadcast",kfs_recv_broadcast},
-            { "report_state",  kfs_report_state  },
-            { "catch_up",      kfs_catch_up      },
-            { "set_heartbeat", kfs_set_heartbeat },
-            { "nodelay",       kfs_nodelay       },
-            { "wndsize",       kfs_wndsize       },
-            { "setmtu",        kfs_setmtu        },
-            { "closed",        kfs_closed        },
-            { "close",         kfs_close         },
-            { "__gc",          kfs_gc            },
+            { "setpeer",        kfs_setpeer        },
+            { "join",           kfs_join           },
+            { "join_start",     kfs_join_start     },
+            { "join_check",     kfs_join_check     },
+            { "send_input",     kfs_send_input     },
+            { "send_ready",     kfs_send_ready     },
+            { "recv_broadcast", kfs_recv_broadcast },
+            { "report_state",   kfs_report_state   },
+            { "catch_up",       kfs_catch_up       },
+            { "set_heartbeat",  kfs_set_heartbeat  },
+            { "nodelay",        kfs_nodelay        },
+            { "wndsize",        kfs_wndsize        },
+            { "setmtu",         kfs_setmtu         },
+            { "closed",         kfs_closed         },
+            { "close",          kfs_close          },
+            { "frame_interval_ms",  kfs_frame_interval },
+            { "room_seed",      kfs_room_seed      },
+            { "server_time_offset_ms", kfs_time_offset },
+            { "start_fid",      kfs_start_fid      },
+            { "is_started",     kfs_is_started     },
+            { "pending_events", kfs_pending_events },
+            { "__gc",           kfs_gc             },
             { NULL, NULL }
         };
         luaL_setfuncs(L, methods, 0);
@@ -104,81 +142,74 @@ static int kfs_new(lua_State *L)
     return 1;
 }
 
-// setpeer(ip, port) — 指定服务器地址
+// setpeer(ip, port) — 指定服务器地址；返回 1 成功 / 0 失败（旧语义）
 static int kfs_setpeer(lua_State *L)
 {
     kfs_client *c = check_client(L, 1);
     const char *ip = luaL_checkstring(L, 2);
     lua_Integer port = luaL_checkinteger(L, 3);
-    struct sockaddr_in peer;
-    int ret;
-
-    memset(&peer, 0, sizeof(peer));
-    peer.sin_family = AF_INET;
-    peer.sin_port = htons((uint16_t)port);
-    if (inet_pton(AF_INET, ip, &peer.sin_addr) != 1)
+    int ret = kfs_client_set_peer(c, ip, (uint16_t)port);
+    if (ret == KFS_ERR_PARAM)
         return luaL_error(L, "error kfs_client_lua: invalid ip '%s'", ip);
-
-    pthread_mutex_lock(&c->lock);
-    ret = (c->net && !c->closed) ? net_set_peer(c->net, &peer) : 0;
-    pthread_mutex_unlock(&c->lock);
-    lua_pushinteger(L, ret);
+    lua_pushinteger(L, (ret == KFS_OK) ? 1 : 0);
     return 1;
 }
 
-// join(room_id[, token]) — 发裸 UDP JOIN 到服务器并等待应答，登记进房间。
-//   服务器从 JOIN 包源地址学到本客户端 ip:port，故无需显式绑定固定端口。
-//   token：会话鉴权令牌（可选；0=不校验，须与服务器 new_room 配置一致）。
-//   返回 1 成功；0 失败（第二返回值为错误描述）。
+// join(room_id[, token]) — 发裸 UDP JOIN 并等待应答（5s 超时，阻塞式）。
+//   返回 1 成功；0 失败（第二返回值为错误描述，文案与旧版一致）。
 static int kfs_join(lua_State *L)
 {
     kfs_client *c = check_client(L, 1);
     lua_Integer room_id = luaL_checkinteger(L, 2);
     lua_Integer token = luaL_optinteger(L, 3, 0);
-    char hs[KFS_HS_LEN2];
-    uint32_t m = KFS_HANDSHAKE_MAGIC;
-    uint32_t rid = (uint32_t)(room_id & 0xFFFFFFFFu);
-    uint32_t tok = (uint32_t)(token & 0xFFFFFFFFu);
-    uint64_t deadline;
-    int ret;
+    int status = kfs_client_join(c, (uint32_t)(room_id & 0xFFFFFFFFu),
+                                 (uint32_t)(token & 0xFFFFFFFFu));
 
-    memcpy(hs, &m, 4);
-    memcpy(hs + 4, &rid, 4);
-    memcpy(hs + 8, &c->conv, 4);
-    memcpy(hs + 12, &tok, 4);
-
-    pthread_mutex_lock(&c->lock);
-    c->joined = 0;
-    c->join_ok = 0;
-    ret = (c->net && !c->closed) ? net_send(c->net, hs, KFS_HS_LEN2) : -1;
-    pthread_mutex_unlock(&c->lock);
-    if (ret < 0) {
-        lua_pushboolean(L, 0);
-        lua_pushstring(L, "no server peer, call setpeer first");
-        return 2;
-    }
-
-    // 等待服务器应答（驱动线程异步更新 joined/join_ok），超时 5s
-    deadline = kfs_now_ms() + 5000;
-    while (kfs_now_ms() < deadline) {
-        pthread_mutex_lock(&c->lock);
-        if (c->joined) {
-            int ok = c->join_ok;
-            pthread_mutex_unlock(&c->lock);
-            lua_pushboolean(L, ok);
-            if (!ok)
-                lua_pushstring(L, "server rejected join");
-            return ok ? 1 : 2;
-        }
-        pthread_mutex_unlock(&c->lock);
-        {
-            struct timespec ts = {0, 5 * 1000 * 1000};   // 5ms 轮询
-            nanosleep(&ts, NULL);
-        }
+    if (status == KFS_OK) {
+        lua_pushboolean(L, 1);
+        return 1;
     }
     lua_pushboolean(L, 0);
-    lua_pushstring(L, "join timeout");
+    switch (status) {
+    case KFS_ERR_NO_PEER:
+        lua_pushstring(L, "no server peer, call setpeer first");
+        break;
+    case KFS_ERR_TIMEOUT:
+        lua_pushstring(L, "join timeout");
+        break;
+    default:
+        lua_pushstring(L, "server rejected join");
+        break;
+    }
     return 2;
+}
+
+// join_start(room_id[, token]) — 非阻塞发起；返回 1 已发出 / 0 失败(原因)
+static int kfs_join_start(lua_State *L)
+{
+    kfs_client *c = check_client(L, 1);
+    lua_Integer room_id = luaL_checkinteger(L, 2);
+    lua_Integer token = luaL_optinteger(L, 3, 0);
+    int status = kfs_client_join_start(c, (uint32_t)(room_id & 0xFFFFFFFFu),
+                                       (uint32_t)(token & 0xFFFFFFFFu));
+    lua_pushinteger(L, (status == KFS_OK) ? 1 : 0);
+    if (status != KFS_OK)
+        lua_pushstring(L, kfs_client_last_error(c));
+    return (status == KFS_OK) ? 1 : 2;
+}
+
+// join_check() — 查询异步 join 状态："pending"|"ok"|"rejected"|"timeout"
+static int kfs_join_check(lua_State *L)
+{
+    kfs_client *c = check_client(L, 1);
+    int status = kfs_client_join_check(c);
+    switch (status) {
+    case KFS_OK:           lua_pushliteral(L, "ok");       break;
+    case KFS_ERR_PENDING:  lua_pushliteral(L, "pending");  break;
+    case KFS_ERR_TIMEOUT:  lua_pushliteral(L, "timeout");  break;
+    default:               lua_pushliteral(L, "rejected"); break;
+    }
+    return 1;
 }
 
 // send_input(frame_id, data) — 上报一帧输入；返回 0 成功
@@ -188,235 +219,99 @@ static int kfs_send_input(lua_State *L)
     lua_Integer fid = luaL_checkinteger(L, 2);
     size_t len;
     const char *data = luaL_checklstring(L, 3, &len);
-    char pkt[KFS_FRAME_MAX_TOTAL];
-    int total, ret;
+    int status;
 
-    if (len > (size_t)KFS_FRAME_MAX_DATA)
+    if (len > (size_t)0xFFFF)
         return luaL_error(L, "error kfs_client_lua: input too large (%zu)", len);
-    total = frame_encode2(pkt, (int)sizeof(pkt), KFS_CMD_INPUT,
-                          (uint32_t)(fid & 0xFFFFFFFFu), data, (int)len);
-    if (total < 0)
-        return luaL_error(L, "error kfs_client_lua: frame encode failed");
-
-    pthread_mutex_lock(&c->lock);
-    if (c->kcp == NULL || c->closed) {
-        pthread_mutex_unlock(&c->lock);
-        return luaL_error(L, "error kfs_client_lua: client closed");
-    }
-    if (!c->joined || !c->join_ok) {
-        pthread_mutex_unlock(&c->lock);
-        return luaL_error(L, "error kfs_client_lua: not joined, call join() first");
-    }
-    ret = ikcp_send(c->kcp, pkt, total);
-    pthread_mutex_unlock(&c->lock);
-    lua_pushinteger(L, ret);
+    status = kfs_client_send_input(c, (uint32_t)(fid & 0xFFFFFFFFu),
+                                   data, (int)len);
+    if (status < 0)
+        client_send_error(L, status);
+    lua_pushinteger(L, status);
     return 1;
 }
 
-// send_ready() — 上报就绪：游戏数据加载完毕后调用。
-//   房间未 start 前（准备阶段）服务器不推帧，靠心跳保活、靠 ready 计数
-//   判定全员就绪；业务层据此调 room:start() 开始同步推帧。
+// send_ready() — 上报就绪（游戏数据加载完毕）；返回 0 成功
 static int kfs_send_ready(lua_State *L)
 {
     kfs_client *c = check_client(L, 1);
-    char pkt[KFS_FRAME_MAX_TOTAL];
-    int total, ret;
-
-    total = frame_encode2(pkt, (int)sizeof(pkt), KFS_CMD_READY, 0, NULL, 0);
-    if (total < 0)
-        return luaL_error(L, "error kfs_client_lua: frame encode failed");
-
-    pthread_mutex_lock(&c->lock);
-    if (c->kcp == NULL || c->closed) {
-        pthread_mutex_unlock(&c->lock);
-        return luaL_error(L, "error kfs_client_lua: client closed");
-    }
-    if (!c->joined || !c->join_ok) {
-        pthread_mutex_unlock(&c->lock);
-        return luaL_error(L, "error kfs_client_lua: not joined, call join() first");
-    }
-    ret = ikcp_send(c->kcp, pkt, total);
-    pthread_mutex_unlock(&c->lock);
-    lua_pushinteger(L, ret);
+    int status = kfs_client_send_ready(c);
+    if (status < 0)
+        client_send_error(L, status);
+    lua_pushinteger(L, status);
     return 1;
 }
 
-// recv_broadcast() → 收服务器广播帧；返回 frame_id, 广播负载；无则 nil
-//   仅取出 CMD_BROADCAST 类型的帧，其他类型（如控制帧）丢弃。
-static int kfs_recv_broadcast(lua_State *L)
+// 填充 (fid, payload, 对账ok) 三返回值
+static int push_frame_event(lua_State *L, const kfs_client_event *ev)
 {
-    kfs_client *c = check_client(L, 1);
-    int size, ret;
-    char *pkt;
-    uint8_t type;
-    uint32_t fid;
-    const char *data;
-    int dlen;
-
-    pthread_mutex_lock(&c->lock);
-    if (c->kcp == NULL || c->closed) {
-        pthread_mutex_unlock(&c->lock);
-        return luaL_error(L, "error kfs_client_lua: client closed");
-    }
-    size = ikcp_peeksize(c->kcp);
-    if (size < KFS_FRAME2_HEADER_SIZE) {
-        pthread_mutex_unlock(&c->lock);
-        return 0;
-    }
-    if (size > KFS_FRAME_MAX_TOTAL) {
-        pthread_mutex_unlock(&c->lock);
-        return luaL_error(L, "error kfs_client_lua: bad frame size %d", size);
-    }
-    pkt = (char *)malloc((size_t)size);
-    if (pkt == NULL) {
-        pthread_mutex_unlock(&c->lock);
-        return luaL_error(L, "error kfs_client_lua: out of memory");
-    }
-    ret = ikcp_recv(c->kcp, pkt, size);
-    pthread_mutex_unlock(&c->lock);
-
-    if (ret < KFS_FRAME2_HEADER_SIZE) {
-        free(pkt);
-        return 0;
-    }
-    if (frame_decode2(pkt, ret, &type, &fid, &data, &dlen) != 0) {
-        free(pkt);
-        return luaL_error(L, "error kfs_client_lua: bad frame payload");
-    }
-    if (type == KFS_CMD_ALL_READY){
-        // 处理全部准备完成
-
-        free(pkt);
-        return 0;
-    }else if (type != KFS_CMD_BROADCAST) {
-        free(pkt);                 // 非广播帧：丢弃
-        return 0;
-    }
-    // 帧对账：广播 payload 末尾 4B 为服务器对该帧全员输入的 FNV-1a32。
-    // 客户端重算 body 比对，一致为 true；不一致即判定该帧不同步（false）。
-    if (dlen >= 4) {
-        uint32_t h_sent, h_calc;
-        memcpy(&h_sent, data + dlen - 4, 4);
-        h_calc = frame_fnv1a(data, dlen - 4);
-        lua_pushinteger(L, (lua_Integer)fid);
-        lua_pushlstring(L, data, (size_t)dlen);
-        lua_pushboolean(L, (h_calc == h_sent));
-    } else {
-        lua_pushinteger(L, (lua_Integer)fid);
-        lua_pushlstring(L, data, (size_t)dlen);
-        lua_pushboolean(L, 0);
-    }
-    free(pkt);
+    lua_pushinteger(L, (lua_Integer)ev->fid);
+    if (ev->data != NULL && ev->len > 0)
+        lua_pushlstring(L, (const char *)ev->data, (size_t)ev->len);
+    else
+        lua_pushliteral(L, "");
+    lua_pushboolean(L, ev->consistent);
     return 3;
 }
 
+// recv_broadcast() → fid, 广播负载, 对账ok；无则 nil
+//   仅消费 KFS_EVENT_FRAME；ALL_READY 等其他事件在 ABI 层自动记账分发。
+static int kfs_recv_broadcast(lua_State *L)
+{
+    kfs_client *c = check_client(L, 1);
+    kfs_client_event ev;
+    int ret;
+
+    memset(&ev, 0, sizeof(ev));
+    ret = kfs_client_poll_frame(c, &ev);
+    if (ret < 0)
+        return luaL_error(L, "error kfs_client_lua: client closed");
+    if (ret == 0)
+        return 0;
+    ret = push_frame_event(L, &ev);
+    kfs_client_event_release(&ev);
+    return ret;
+}
+
 // report_state(frame_id, hash) — 上报某帧逻辑状态哈希（4B），供服务器对账
-//   （服务器收集全员 state_hash 比对推进一致点 / 标记不同步）。
 static int kfs_report_state(lua_State *L)
 {
     kfs_client *c = check_client(L, 1);
     lua_Integer fid = luaL_checkinteger(L, 2);
     lua_Integer h   = luaL_checkinteger(L, 3);
-    char pkt[KFS_FRAME_MAX_TOTAL];
-    uint32_t hh = (uint32_t)(h & 0xFFFFFFFFu);
-    int total, ret;
-
-    total = frame_encode2(pkt, (int)sizeof(pkt), KFS_CMD_STATE,
-                          (uint32_t)(fid & 0xFFFFFFFFu),
-                          (const char *)&hh, 4);
-    if (total < 0)
-        return luaL_error(L, "error kfs_client_lua: frame encode failed");
-
-    pthread_mutex_lock(&c->lock);
-    if (c->kcp == NULL || c->closed) {
-        pthread_mutex_unlock(&c->lock);
-        return luaL_error(L, "error kfs_client_lua: client closed");
-    }
-    if (!c->joined || !c->join_ok) {
-        pthread_mutex_unlock(&c->lock);
-        return luaL_error(L, "error kfs_client_lua: not joined, call join() first");
-    }
-    ret = ikcp_send(c->kcp, pkt, total);
-    pthread_mutex_unlock(&c->lock);
-    lua_pushinteger(L, ret);
+    int status = kfs_client_report_state(c, (uint32_t)(fid & 0xFFFFFFFFu),
+                                        (uint32_t)(h & 0xFFFFFFFFu));
+    if (status < 0)
+        client_send_error(L, status);
+    lua_pushinteger(L, status);
     return 1;
 }
 
-// catch_up() — 追帧：丢弃 KCP 接收缓冲里积压的旧广播，只保留最新一帧返回。
-//   用于客户端严重滞后时快速跳到服务器当前帧（比逐帧 recv 更高效）。
+// catch_up() — 追帧：丢弃积压旧广播，只返回最新一帧。
 //   返回 (frame_id, 负载, 对账ok)；无广播则 nil。
 static int kfs_catch_up(lua_State *L)
 {
     kfs_client *c = check_client(L, 1);
-    char scratch[KFS_FRAME_MAX_TOTAL];
-    int got = 0;
-    uint32_t last_fid = 0;
-    int last_len = 0;
-    char *last_pkt = NULL;
-    int last_ok = 0;
+    kfs_client_event ev;
+    int ret;
 
-    pthread_mutex_lock(&c->lock);
-    if (c->kcp == NULL || c->closed) {
-        pthread_mutex_unlock(&c->lock);
+    memset(&ev, 0, sizeof(ev));
+    ret = kfs_client_catch_up(c, &ev);
+    if (ret < 0)
         return luaL_error(L, "error kfs_client_lua: client closed");
-    }
-    while (1) {
-        int size = ikcp_peeksize(c->kcp);
-        int r;
-        uint8_t type;
-        uint32_t fid;
-        const char *data;
-        int dlen;
-        if (size < KFS_FRAME2_HEADER_SIZE)
-            break;
-        if (size > KFS_FRAME_MAX_TOTAL) {
-            ikcp_recv(c->kcp, scratch, (int)sizeof(scratch));   // 坏帧丢弃
-            continue;
-        }
-        r = ikcp_recv(c->kcp, scratch, size);
-        if (r < KFS_FRAME2_HEADER_SIZE)
-            break;
-        if (frame_decode2(scratch, r, &type, &fid, &data, &dlen) != 0)
-            continue;
-        if (type != KFS_CMD_BROADCAST)
-            continue;                           // 非广播帧：丢弃
-        free(last_pkt);                          // 丢弃更旧的广播，只留最新
-        last_pkt = (char *)malloc((size_t)(dlen > 0 ? dlen : 1));
-        if (last_pkt == NULL)
-            break;
-        if (dlen > 0)
-            memcpy(last_pkt, data, (size_t)dlen);
-        last_len = dlen;
-        last_fid = fid;
-        got = 1;
-        last_ok = 0;
-        if (dlen >= 4) {
-            uint32_t h_sent, h_calc;
-            memcpy(&h_sent, data + dlen - 4, 4);
-            h_calc = frame_fnv1a(data, dlen - 4);
-            last_ok = (h_calc == h_sent);
-        }
-    }
-    pthread_mutex_unlock(&c->lock);
-
-    if (!got || last_pkt == NULL)
+    if (ret == 0)
         return 0;
-    lua_pushinteger(L, (lua_Integer)last_fid);
-    lua_pushlstring(L, last_pkt, (size_t)last_len);
-    lua_pushboolean(L, last_ok);
-    free(last_pkt);
-    return 3;
+    ret = push_frame_event(L, &ev);
+    kfs_client_event_release(&ev);
+    return ret;
 }
 
-// set_heartbeat(ms) — 设置自动心跳间隔（0=关闭；驱动线程按此定期补发 HEARTBEAT）
+// set_heartbeat(ms) — 设置自动心跳间隔（0=关闭）
 static int kfs_set_heartbeat(lua_State *L)
 {
     kfs_client *c = check_client(L, 1);
     int ms = (int)luaL_optinteger(L, 2, 0);
-    pthread_mutex_lock(&c->lock);
-    c->heartbeat_ms = (ms < 0) ? 0 : ms;
-    c->last_heartbeat_ms = kfs_now_ms();        // 从现在起计时
-    pthread_mutex_unlock(&c->lock);
+    kfs_client_set_heartbeat(c, ms);
     return 0;
 }
 
@@ -424,14 +319,9 @@ static int kfs_set_heartbeat(lua_State *L)
 static int kfs_nodelay(lua_State *L)
 {
     kfs_client *c = check_client(L, 1);
-    int nodelay = (int)luaL_checkinteger(L, 2);
-    int interval = (int)luaL_checkinteger(L, 3);
-    int resend   = (int)luaL_checkinteger(L, 4);
-    int nc       = (int)luaL_checkinteger(L, 5);
-    int ret;
-    pthread_mutex_lock(&c->lock);
-    ret = (c->kcp) ? ikcp_nodelay(c->kcp, nodelay, interval, resend, nc) : -1;
-    pthread_mutex_unlock(&c->lock);
+    int ret = kfs_client_nodelay(c,
+        (int)luaL_checkinteger(L, 2), (int)luaL_checkinteger(L, 3),
+        (int)luaL_checkinteger(L, 4), (int)luaL_checkinteger(L, 5));
     lua_pushinteger(L, ret);
     return 1;
 }
@@ -439,12 +329,8 @@ static int kfs_nodelay(lua_State *L)
 static int kfs_wndsize(lua_State *L)
 {
     kfs_client *c = check_client(L, 1);
-    int sndwnd = (int)luaL_checkinteger(L, 2);
-    int rcvwnd = (int)luaL_checkinteger(L, 3);
-    int ret;
-    pthread_mutex_lock(&c->lock);
-    ret = (c->kcp) ? ikcp_wndsize(c->kcp, sndwnd, rcvwnd) : -1;
-    pthread_mutex_unlock(&c->lock);
+    int ret = kfs_client_wndsize(c,
+        (int)luaL_checkinteger(L, 2), (int)luaL_checkinteger(L, 3));
     lua_pushinteger(L, ret);
     return 1;
 }
@@ -452,76 +338,94 @@ static int kfs_wndsize(lua_State *L)
 static int kfs_setmtu(lua_State *L)
 {
     kfs_client *c = check_client(L, 1);
-    int mtu = (int)luaL_checkinteger(L, 2);
-    int ret;
-    pthread_mutex_lock(&c->lock);
-    ret = (c->kcp) ? ikcp_setmtu(c->kcp, mtu) : -1;
-    pthread_mutex_unlock(&c->lock);
+    int ret = kfs_client_setmtu(c, (int)luaL_checkinteger(L, 2));
     lua_pushinteger(L, ret);
+    return 1;
+}
+
+// 会话锚点查询（join 成功后由驱动线程自动锚定）
+static int kfs_frame_interval(lua_State *L)
+{
+    lua_pushinteger(L, (lua_Integer)kfs_client_frame_interval_ms(check_client(L, 1)));
+    return 1;
+}
+
+static int kfs_room_seed(lua_State *L)
+{
+    lua_pushinteger(L, (lua_Integer)kfs_client_room_seed(check_client(L, 1)));
+    return 1;
+}
+
+static int kfs_time_offset(lua_State *L)
+{
+    lua_pushinteger(L, (lua_Integer)kfs_client_server_time_offset_ms(check_client(L, 1)));
+    return 1;
+}
+
+static int kfs_start_fid(lua_State *L)
+{
+    lua_pushinteger(L, (lua_Integer)kfs_client_start_fid(check_client(L, 1)));
+    return 1;
+}
+
+static int kfs_is_started(lua_State *L)
+{
+    lua_pushboolean(L, kfs_client_is_started(check_client(L, 1)));
+    return 1;
+}
+
+static int kfs_pending_events(lua_State *L)
+{
+    lua_pushinteger(L, (lua_Integer)kfs_client_pending_events(check_client(L, 1)));
     return 1;
 }
 
 static int kfs_closed(lua_State *L)
 {
-    kfs_client *c = check_client(L, 1);
-    lua_pushboolean(L, c->closed);
+    kfs_udata *ud = (kfs_udata *)luaL_checkudata(L, 1, "kfsclientlib");
+    lua_pushboolean(L, (ud->c == NULL || kfs_client_is_closed(ud->c)) ? 1 : 0);
     return 1;
 }
 
-// close() — 停驱动线程、关 socket、释放 KCP（幂等）
-static void kfs_close_impl(kfs_client *c)
-{
-    // 置 closed，让驱动线程安全退出（驱动线程见 closed 后不再访问 net/kcp）
-    pthread_mutex_lock(&c->lock);
-    c->closed = 1;
-    pthread_mutex_unlock(&c->lock);
-
-    if (c->djoined == 0) {
-        pthread_join(c->dthread, NULL);   // 先 join，确保驱动线程已退出
-        c->djoined = 1;
-    }
-    if (c->kcp) {
-        ikcp_release(c->kcp);
-        c->kcp = NULL;
-    }
-    if (c->net) {
-        net_close(c->net);
-        c->net = NULL;
-    }
-}
-
+// close() — 停驱动线程、关 socket、释放会话（幂等；置空防 __gc 二次销毁）
 static int kfs_close(lua_State *L)
 {
-    kfs_client *c = check_client(L, 1);
-    kfs_close_impl(c);
+    kfs_udata *ud = (kfs_udata *)luaL_checkudata(L, 1, "kfsclientlib");
+    if (ud->c != NULL) {
+        kfs_client_destroy(ud->c);
+        ud->c = NULL;
+    }
     return 0;
 }
 
 static int kfs_gc(lua_State *L)
 {
-    kfs_client *c = check_client(L, 1);
-    kfs_close_impl(c);
-    pthread_mutex_destroy(&c->lock);
-    return 0;
+    return kfs_close(L);
 }
 
 //---------------------------------------------------------------------
 // 模块入口
 //---------------------------------------------------------------------
+static int kfs_version(lua_State *L)
+{
+    lua_pushstring(L, kfs_client_version());
+    return 1;
+}
+
 static const luaL_Reg kfs_client_module[] = {
-    { "new", kfs_new },
+    { "new",     kfs_new     },
+    { "version", kfs_version },
     { NULL, NULL }
 };
 
 #if defined(__GNUC__)
-#define KFS_API __attribute__((visibility("default")))
+#define KFS_LUA_API __attribute__((visibility("default")))
 #else
-#define KFS_API
+#define KFS_LUA_API
 #endif
 
-KFS_API int luaopen_kfsclientlib(lua_State *L)
+KFS_LUA_API int luaopen_kfsclientlib(lua_State *L)
 {
     luaL_newlib(L, kfs_client_module);
     return 1;
 }
-

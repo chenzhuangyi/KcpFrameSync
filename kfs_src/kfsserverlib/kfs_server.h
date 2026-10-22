@@ -79,6 +79,8 @@ typedef enum {
     KFS_PSTATE_DISCONNECT   = 3,   // 已掉线：席位保留，不参与收集与广播（预留）
 } kfs_pstate;
 
+// 玩家"初始化"（未有连接）
+#define KFS_PLAYER_INIT(pl)  ((pl)->state == KFS_PSTATE_INIT)
 // 玩家"在线"（有连接，驱动 update/收包/广播）
 #define KFS_PLAYER_ONLINE(pl)  ((pl)->state == KFS_PSTATE_ONLINE)
 // 玩家"活跃"（在线且未掉线，参与本帧集齐判定；掉线玩家不阻塞集齐）

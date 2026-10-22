@@ -9,7 +9,10 @@
 #
 # 产物：
 #   build/kfsserverlib.so      （服务器库，require("kfsserverlib")）
-#   build/kfsclientlib.so      （客户端库，require("kfsclientlib")）
+#   build/kfsclientlib.so      （客户端库含 Lua 绑定，require("kfsclientlib")）
+#   build/libkfsclient.so      （客户端纯 C ABI 库，无 Lua 依赖；
+#                                Unity/Go/Rust 等宿主 DllImport/链接此库，
+#                                接口契约见 kfsclientlib/kfs_client_api.h）
 #   build/lua/lua              （用内置 Lua 5.4.8 源码编译的解释器）
 #
 # 在 Linux 服务器上构建：
@@ -46,6 +49,8 @@ SOFLAGS  = -shared
 # 服务器库与客户端库两个产物（共享 common 底层 + third/kcp）
 TARGET_SERVER = $(BUILD_DIR)/kfsserverlib.so
 TARGET_CLIENT = $(BUILD_DIR)/kfsclientlib.so
+# 纯 C ABI 客户端库：不含 Lua 绑定，供 Unity 等宿主直接链接/DllImport
+TARGET_CLIENT_ABI = $(BUILD_DIR)/libkfsclient.so
 OBJS_COMMON = $(BUILD_DIR)/kcp/ikcp.o \
               $(BUILD_DIR)/net.o \
               $(BUILD_DIR)/frame.o \
@@ -54,18 +59,22 @@ OBJS_COMMON = $(BUILD_DIR)/kcp/ikcp.o \
 OBJS_SERVER = $(OBJS_COMMON) \
               $(BUILD_DIR)/kfsserverlib/kfs_core.o \
               $(BUILD_DIR)/kfsserverlib/kfs_lua.o
-OBJS_CLIENT = $(OBJS_COMMON) \
-              $(BUILD_DIR)/kfsclientlib/kfs_client_core.o \
+OBJS_CLIENT_CORE = $(OBJS_COMMON) \
+              $(BUILD_DIR)/kfsclientlib/kfs_client_core.o
+OBJS_CLIENT = $(OBJS_CLIENT_CORE) \
               $(BUILD_DIR)/kfsclientlib/kfs_client_lua.o
 
 # ---- 目标规则 --------------------------------------------------------
-all: $(TARGET_SERVER) $(TARGET_CLIENT)
+all: $(TARGET_SERVER) $(TARGET_CLIENT) $(TARGET_CLIENT_ABI)
 
 $(TARGET_SERVER): $(OBJS_SERVER)
 	$(CC) $(SOFLAGS) -o $@ $(OBJS_SERVER) $(LIBS)
 
 $(TARGET_CLIENT): $(OBJS_CLIENT)
 	$(CC) $(SOFLAGS) -o $@ $(OBJS_CLIENT) $(LIBS)
+
+$(TARGET_CLIENT_ABI): $(OBJS_CLIENT_CORE)
+	$(CC) $(SOFLAGS) -o $@ $(OBJS_CLIENT_CORE) $(LIBS)
 
 $(BUILD_DIR)/kcp/ikcp.o: third/kcp/ikcp.c third/kcp/ikcp.h
 	@mkdir -p $(dir $@)
@@ -95,21 +104,23 @@ $(BUILD_DIR)/kfsserverlib/kfs_lua.o: kfsserverlib/kfs_lua.c kfsserverlib/kfs_ser
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c -o $@ kfsserverlib/kfs_lua.c
 
-$(BUILD_DIR)/kfsclientlib/kfs_client_core.o: kfsclientlib/kfs_client_core.c kfsclientlib/kfs_client.h
+$(BUILD_DIR)/kfsclientlib/kfs_client_core.o: kfsclientlib/kfs_client_core.c kfsclientlib/kfs_client.h kfsclientlib/kfs_client_api.h common/frame.h common/net.h
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -c -o $@ kfsclientlib/kfs_client_core.c
+	$(CC) $(CFLAGS) -DKFS_CLIENT_EXPORTS -c -o $@ kfsclientlib/kfs_client_core.c
 
-$(BUILD_DIR)/kfsclientlib/kfs_client_lua.o: kfsclientlib/kfs_client_lua.c kfsclientlib/kfs_client.h
+$(BUILD_DIR)/kfsclientlib/kfs_client_lua.o: kfsclientlib/kfs_client_lua.c kfsclientlib/kfs_client_api.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c -o $@ kfsclientlib/kfs_client_lua.c
 
-# 安装到系统 Lua 模块路径（Ubuntu/Debian 默认）
+# 安装到系统 Lua 模块路径（Ubuntu/Debian 默认）；纯 ABI 库装到常规 lib
 PREFIX ?= /usr/local
 LUA_VERSION ?= 5.4
-install: $(TARGET_SERVER) $(TARGET_CLIENT)
+install: $(TARGET_SERVER) $(TARGET_CLIENT) $(TARGET_CLIENT_ABI)
 	install -d $(DESTDIR)$(PREFIX)/lib/lua/$(LUA_VERSION)
 	install -m 0755 $(TARGET_SERVER) $(DESTDIR)$(PREFIX)/lib/lua/$(LUA_VERSION)/
 	install -m 0755 $(TARGET_CLIENT) $(DESTDIR)$(PREFIX)/lib/lua/$(LUA_VERSION)/
+	install -d $(DESTDIR)$(PREFIX)/lib
+	install -m 0755 $(TARGET_CLIENT_ABI) $(DESTDIR)$(PREFIX)/lib/
 
 # ---- 自包含 Lua 5.4.8 解释器（中间文件在 $(BUILD_DIR)/lua/） ----------
 # 用法：make lua  → 产出 $(BUILD_DIR)/lua/lua 可执行文件
@@ -140,11 +151,16 @@ zig:
 		-shared -o $(TARGET_SERVER) \
 		third/kcp/ikcp.c common/net.c common/frame.c common/kfs_util.c common/log.c \
 		kfsserverlib/kfs_core.c kfsserverlib/kfs_lua.c -lpthread
-	$(ZIG) cc -target $(ZIG_TARGET) -O2 -fPIC -fvisibility=hidden \
+	$(ZIG) cc -target $(ZIG_TARGET) -O2 -fPIC -fvisibility=hidden -DKFS_CLIENT_EXPORTS \
 		$(LUA_INC) -Icommon -Ithird \
 		-shared -o $(TARGET_CLIENT) \
 		third/kcp/ikcp.c common/net.c common/frame.c common/kfs_util.c common/log.c \
 		kfsclientlib/kfs_client_core.c kfsclientlib/kfs_client_lua.c -lpthread
+	$(ZIG) cc -target $(ZIG_TARGET) -O2 -fPIC -fvisibility=hidden -DKFS_CLIENT_EXPORTS \
+		-Icommon -Ithird \
+		-shared -o $(TARGET_CLIENT_ABI) \
+		third/kcp/ikcp.c common/net.c common/frame.c common/kfs_util.c common/log.c \
+		kfsclientlib/kfs_client_core.c -lpthread
 
 clean:
 	rm -rf $(BUILD_DIR)

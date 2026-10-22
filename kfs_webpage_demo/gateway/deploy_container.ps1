@@ -24,7 +24,7 @@ Write-Output "容器: $container"
 Write-Output "目标: ${container}:$gatewayDest"
 
 docker exec $container mkdir -p "$gatewayDest/node_modules"
-foreach ($f in @('gateway.js', 'ikcp.js', 'bridge_container.js', 'start_container.sh')) {
+foreach ($f in @('gateway.js', 'ikcp.js', 'start_container.sh')) {
     if (-not (Test-Path (Join-Path $here $f))) {
         throw "缺少文件: $(Join-Path $here $f)"
     }
@@ -35,10 +35,10 @@ docker exec $container rm -rf "$gatewayDest/node_modules/ws"
 docker cp "$here\node_modules\ws" "${container}:$gatewayDest/node_modules/ws"
 docker exec $container chmod +x "$gatewayDest/start_container.sh"
 
-# 只重启网关和桥；server.lua 保持运行（token 不变，网页里已有的 token 继续有效）
+# 只重启网关；server.lua 保持运行（token 不变，网页里已有的 token 继续有效）
 docker exec -e RESTART_GATEWAY=1 $container "$gatewayDest/start_container.sh"
 
 Write-Output ""
 Write-Output "容器内网关已更新: ws://127.0.0.1:18080"
-Write-Output "容器内 Unity 桥已更新: tcp/10500 -> udp/<udp_port>"
-Write-Output "网页网关地址填 ws://127.0.0.1:18080；Unity 用 bridge_windows.js 时 setpeer('127.0.0.1', 10501)。"
+Write-Output "容器内已移除 UDP/TCP 中转桥；网关直连 udp/<udp_port>"
+Write-Output "网页网关地址填 ws://127.0.0.1:18080；Unity 直连服务器 UDP 端口 setpeer('127.0.0.1', 10500)。"
