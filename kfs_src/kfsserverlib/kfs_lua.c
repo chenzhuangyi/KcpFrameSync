@@ -165,6 +165,8 @@ static int kfs_conn_create_room(lua_State *L)
     room = (kfs_room_t *)lua_newuserdatauv(L, sizeof(kfs_room_t), 0);
     room->r = netref_addref(r);
     room->kcp = NULL;
+    room->scratch = NULL;               // 收包复用缓冲：首次 recv 时惰性分配
+    room->scratch_cap = 0;
     room->ctx.r = r;
     room->ctx.peer = NULL;              // 点对点：发已学对端
     room->kcp = ikcp_create((IUINT32)conv, (void *)&room->ctx);
@@ -475,7 +477,6 @@ static int kfs_room_recv(lua_State *L)
     kfs_room_t *room = check_room(L, 1);
     kfs_netref *r = room->r;
     int size, ret;
-    char *buf;
     if (r == NULL)
         return luaL_error(L, "error kfs_lua: room gone");
     pthread_mutex_lock(&r->lock);
@@ -488,16 +489,23 @@ static int kfs_room_recv(lua_State *L)
         pthread_mutex_unlock(&r->lock);
         return 0;
     }
-    buf = (char *)malloc((size_t)size);
-    if (buf == NULL) {
+    if (size > KFS_FRAME_MAX_TOTAL) {
         pthread_mutex_unlock(&r->lock);
-        return luaL_error(L, "error kfs_lua: out of memory");
+        return luaL_error(L, "error kfs_lua: bad frame size %d", size);
     }
-    ret = ikcp_recv(room->kcp, buf, size);
+    // 复用缓冲：首次按需分配上限，之后每帧零分配
+    if (room->scratch == NULL) {
+        room->scratch = (char *)malloc(KFS_FRAME_MAX_TOTAL);
+        if (room->scratch == NULL) {
+            pthread_mutex_unlock(&r->lock);
+            return luaL_error(L, "error kfs_lua: out of memory");
+        }
+        room->scratch_cap = KFS_FRAME_MAX_TOTAL;
+    }
+    ret = ikcp_recv(room->kcp, room->scratch, size);
     pthread_mutex_unlock(&r->lock);
-    if (ret < 0) { free(buf); return 0; }
-    lua_pushlstring(L, buf, (size_t)ret);
-    free(buf);
+    if (ret < 0) return 0;
+    lua_pushlstring(L, room->scratch, (size_t)ret);
     return 1;
 }
 
@@ -649,22 +657,24 @@ static int kfs_room_recv_frame(lua_State *L)
         pthread_mutex_unlock(&r->lock);
         return luaL_error(L, "error kfs_lua: bad frame size %d", size);
     }
-    pkt = (char *)malloc((size_t)size);
-    if (pkt == NULL) {
-        pthread_mutex_unlock(&r->lock);
-        return luaL_error(L, "error kfs_lua: out of memory");
+    // 复用缓冲（与 room:recv 同一块）：首次按上限分配，之后每帧零分配
+    if (room->scratch == NULL) {
+        room->scratch = (char *)malloc(KFS_FRAME_MAX_TOTAL);
+        if (room->scratch == NULL) {
+            pthread_mutex_unlock(&r->lock);
+            return luaL_error(L, "error kfs_lua: out of memory");
+        }
+        room->scratch_cap = KFS_FRAME_MAX_TOTAL;
     }
+    pkt = room->scratch;
     ret = ikcp_recv(room->kcp, pkt, size);
     pthread_mutex_unlock(&r->lock);
 
-    if (ret < KFS_FRAME_HEADER_SIZE) { free(pkt); return 0; }
-    if (frame_decode(pkt, ret, &fid, &data, &dlen) != 0) {
-        free(pkt);
+    if (ret < KFS_FRAME_HEADER_SIZE) return 0;
+    if (frame_decode(pkt, ret, &fid, &data, &dlen) != 0)
         return luaL_error(L, "error kfs_lua: bad frame payload");
-    }
     lua_pushinteger(L, (lua_Integer)fid);
     lua_pushlstring(L, data, (size_t)dlen);
-    free(pkt);
     return 2;
 }
 
@@ -701,6 +711,11 @@ static int kfs_room_close(lua_State *L)
         netref_release(room->r);
         room->r = NULL;
     }
+    if (room->scratch) {                          // 复用缓冲随对象释放
+        free(room->scratch);
+        room->scratch = NULL;
+        room->scratch_cap = 0;
+    }
     return 0;
 }
 
@@ -718,6 +733,11 @@ static int kfs_room_gc(lua_State *L)
         pthread_mutex_unlock(&room->r->lock);
         netref_release(room->r);
         room->r = NULL;
+    }
+    if (room->scratch) {                          // 复用缓冲随对象释放（与 close 幂等）
+        free(room->scratch);
+        room->scratch = NULL;
+        room->scratch_cap = 0;
     }
     return 0;
 }

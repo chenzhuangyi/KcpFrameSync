@@ -30,6 +30,9 @@
 #include <lauxlib.h>
 #include <lualib.h>
 
+// uthash：conv→玩家 全局索引、room_id→房间 索引（替代线性扫描）
+#include "uthash/src/uthash.h"
+
 //---------------------------------------------------------------------
 // 常量
 //---------------------------------------------------------------------
@@ -86,7 +89,20 @@ typedef enum {
 // 玩家"活跃"（在线且未掉线，参与本帧集齐判定；掉线玩家不阻塞集齐）
 #define KFS_PLAYER_ACTIVE(pl)  ((pl)->state == KFS_PSTATE_ONLINE && !(pl)->offline)
 
-// 多玩家房间内的一个玩家会话
+// 互相引用：仅用 struct 标签前置声明（C89 兼容；同名 typedef 重复声明在
+// 旧 GCC 下会报错）。完整定义见下方。
+struct kfs_room;
+struct kfs_player;
+
+// conv → 玩家 全局索引节点（uthash，仅 ONLINE 态玩家挂表）。
+//   动机：players[] 是定长数组、remove 时元素会被搬移，uthash 句柄不能内嵌
+//   在玩家里（结构体拷贝会破坏哈希链），故用独立轻节点持指针；增删只发生在
+//   JOIN/移除/关房等低频事件，节点分配可接受。
+typedef struct kfs_plink {
+    UT_hash_handle hh;          // key = conv
+    uint32_t conv;
+    struct kfs_player *pl;      // 指向 room->players[] 槽位（remove swap 后需修正）
+} kfs_plink;
 typedef struct kfs_player {
     uint32_t conv;              // KCP conv（玩家会话标识）
     int      state;             // KFS_PSTATE_*：INIT=初始登记 / ONLINE=在线 / LEFT=已转房
@@ -96,7 +112,7 @@ typedef struct kfs_player {
     ikcpcb  *kcp;               // 该玩家 KCP 会话（INIT/LEFT 为 NULL）
     kfs_send_ctx ctx;           // 发送上下文（peer = &player->peer）
     uint32_t fid_last;          // 最近上报帧号（超时判定）
-    int      room_index;        // 所属房间在 rooms 数组的下标（-1 表示未挂）
+    struct kfs_room *room;      // 所属房间（堆分配，地址稳定；NULL=未挂）
     int      slot_index;        // 在房间 players 数组的下标
     kfs_pframe pend[KFS_PLAYER_BUF];   // 超前输入环形缓冲（按 fid 取槽）
     uint64_t last_active_ms;    // 最后活跃时间（心跳/输入刷新，掉线判定）
@@ -104,8 +120,12 @@ typedef struct kfs_player {
     int      state_valid[KFS_PLAYER_BUF];// 该槽 state_hash 是否有效
 } kfs_player;
 
-// 多玩家房间：收集全员输入后广播
+// 多玩家房间：收集全员输入后广播。
+//   堆分配单对象后按 room_id 挂入 netref->rooms 哈希（uthash 句柄必须位于
+//   结构首字段），查找 O(1)；替代旧"realloc 数组 + 线性扫描"，房间地址从此
+//   稳定，玩家可直接持 room 指针。
 typedef struct kfs_room {
+    UT_hash_handle hh;          // 必须首位：key = room_id
     uint32_t room_id;
     int      max_player;        // 设定的最大玩家数（创建时配置；满员判定/初始人数校验用）
     int      init_count;        // 初始玩家数（创建房间时预登记为 INIT；掉线不移除，席位保留等重连）
@@ -159,9 +179,10 @@ typedef struct kfs_netref {
     int         rcount; // 已注册房间数
     int         rcap;   // 路由表容量
 
-    kfs_room *rooms;    // 多玩家房间表（服务器收集转发）
-    int        room_count;
-    int        room_cap;
+    kfs_room *rooms;    // 多玩家房间表（uthash：room_id → kfs_room*，堆分配对象）
+    int        room_count;   // 当前房间数（uthash HASH_COUNT 同步维护，调试/遍历用）
+
+    kfs_plink *pl_index; // 全局 conv→玩家 索引（仅 ONLINE 态挂表；驱动线程收包 O(1) 路由）
 
     kfs_event *events;  // 收帧事件队列（驱动线程 push，poll 取走）
     int         ecount; // 未取事件数
@@ -188,6 +209,10 @@ typedef struct {
     kfs_netref *r;      // 借用同一网络句柄（refs+1）
     ikcpcb     *kcp;    // KCP 会话
     kfs_send_ctx ctx;   // 发送上下文（点对点：peer=NULL，发已学对端）
+    // 收包复用缓冲：recv/recv_frame 首次用到时按需分配到上限后复用，
+    // 消除每帧 malloc/free；close/__gc 释放。
+    char      *scratch;
+    int        scratch_cap;
 } kfs_room_t;
 
 // 服务器多玩家房间实例（conn:new_room 返回）
