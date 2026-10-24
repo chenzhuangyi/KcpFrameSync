@@ -34,18 +34,6 @@
 #include "uthash/src/uthash.h"
 
 //---------------------------------------------------------------------
-// 常量
-//---------------------------------------------------------------------
-// 房间最大玩家数
-#define KFS_ROOM_MAX_PLAYER 32
-// 单帧单玩家输入上限（原型定长，可改动态）
-#define KFS_ROOM_INPUT_MAX  512
-
-// 超前输入窗口：玩家 KCP 里可能同时缓存未来多帧输入，用环形缓冲暂存，
-// 容量须 ≥ 输入提前量窗口 K（+ 余量），供服务器按帧号取用。
-#define KFS_PLAYER_BUF 8
-
-//---------------------------------------------------------------------
 // 结构定义
 //---------------------------------------------------------------------
 // 一帧超前输入（环形缓冲槽）
@@ -53,7 +41,7 @@ typedef struct kfs_pframe {
     uint32_t fid;           // 帧号
     int      valid;         // 该槽是否已填充
     int      len;           // 输入长度
-    char     data[KFS_ROOM_INPUT_MAX];
+    char     data[KFS_FRAME_INPUT_MAX];
 } kfs_pframe;
 
 // 玩家会话 token 登记项（per-player 鉴权）
@@ -135,7 +123,7 @@ typedef struct kfs_room {
     int      phase;             // 0=准备(PREPARE) 1=对局中(PLAYING)；PLAYING 才收集推帧
     uint32_t collecting_fid;    // 当前待收集帧号
     uint32_t recv_mask;         // 位掩码：哪些玩家已上报本帧
-    char  input_buf[KFS_ROOM_MAX_PLAYER][KFS_ROOM_INPUT_MAX];
+    char  input_buf[KFS_ROOM_MAX_PLAYER][KFS_FRAME_INPUT_MAX];
     int   input_len[KFS_ROOM_MAX_PLAYER];
 
     uint64_t collect_begin_ms;  // 当前帧开始收集的时间（超时兜底用）

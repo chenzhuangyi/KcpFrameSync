@@ -127,7 +127,7 @@ KFS_CAPI int kfs_client_join_check(kfs_client *c);
 //---------------------------------------------------------------------
 // 业务上行（帧编码在本层完成，宿主只见语义接口）
 //---------------------------------------------------------------------
-// 上报一帧输入（KFS_CMD_INPUT）。len 上限 0xFFFF。
+// 上报一帧输入（KFS_CMD_INPUT）。len 上限 KFS_FRAME_INPUT_MAX(32)，超限返回 KFS_ERR_PARAM。
 KFS_CAPI int kfs_client_send_input(kfs_client *c, uint32_t frame_id,
                                    const void *data, int len);
 

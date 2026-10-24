@@ -238,7 +238,16 @@ static int kfs_send_frame(kfs_client *c, uint8_t type, uint32_t fid,
 
     if (c == NULL)
         return KFS_ERR;
-    if (len < 0 || len > KFS_FRAME_MAX_DATA)
+    if (len < 0)
+        return KFS_ERR_PARAM;
+    // 单客户端单帧输入上限（协议契约 KFS_FRAME_INPUT_MAX=32）：仅 INPUT 帧适用，
+    // 发送侧主动拒绝，避免把超长帧打进网络白耗带宽（服务器收侧另有防御性丢弃）。
+    if (type == KFS_CMD_INPUT && len > KFS_FRAME_INPUT_MAX) {
+        kfs_set_err(c, "input frame too long");
+        return KFS_ERR_PARAM;
+    }
+    // 其余帧类型仍按广播最坏情况总负载上限兜底
+    if (len > KFS_FRAME_MAX_DATA)
         return KFS_ERR_PARAM;
     total = frame_encode2(pkt, (int)sizeof(pkt), type, fid,
                           (const char *)data, len);

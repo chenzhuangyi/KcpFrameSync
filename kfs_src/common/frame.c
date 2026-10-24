@@ -12,6 +12,10 @@
 
 #include <string.h>
 
+
+// 协议包
+
+
 // 编码：把帧号+负载打包进 out。
 // 失败条件：out 为空、out_cap 不足以容纳帧头、len 超上限。
 int frame_encode(char *out, int out_cap, uint32_t fid,

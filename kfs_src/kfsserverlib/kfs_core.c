@@ -277,8 +277,8 @@ static int kfs_room_build_broadcast(kfs_room *room, char *out, int out_cap)
         if (!KFS_PLAYER_ONLINE(&room->players[i]))
             continue;
         len = room->input_len[i];
-        if (len > KFS_ROOM_INPUT_MAX)
-            len = KFS_ROOM_INPUT_MAX;             // 防御：异常长度截断
+        if (len > KFS_FRAME_INPUT_MAX)
+            continue;             // 防御：异常长度
         // 本条需 6B+data，末尾还要留 4B 哈希；放不下即整帧放弃（等价旧版 malloc 失败）
         if (out_cap - (int)(p - out) < 6 + len + 4)
             return -1;
@@ -528,8 +528,11 @@ static void kfs_player_recv_pump(kfs_netref *r, kfs_player *pl, uint64_t now_ms)
             continue;                           // 其他控制帧忽略
 
         // 输入合法性校验（P0-4）
-        if (dlen > KFS_ROOM_INPUT_MAX)
+        if (dlen > KFS_FRAME_INPUT_MAX) {
+            LOG_DEBUGF("drop oversized INPUT conv=%d fid=%d len=%d > %d",
+                       pl->conv, fid, dlen, KFS_FRAME_INPUT_MAX);
             continue;                           // 超长输入：拒绝
+        }
         if (fid > room->collecting_fid + KFS_PLAYER_BUF || fid < room->sync_fid)
             continue;                           // 超前超过缓冲窗口：拒绝（防灌帧/异常帧号）
 

@@ -23,6 +23,20 @@
 extern "C" {
 #endif
 
+
+//---------------------------------------------------------------------
+// 常量
+//---------------------------------------------------------------------
+// 最大房间数（预留）
+#define KFS_ROOM_MAX 256
+
+// 房间最大玩家数
+#define KFS_ROOM_MAX_PLAYER 32
+// 单个客户端单帧输入上限（协议契约，全链路统一：
+//   客户端发送侧主动拒绝 + 服务器收侧防御丢弃，单一事实源）
+#define KFS_FRAME_INPUT_MAX  32
+
+
 // 旧帧头长度（frame_id 4B + data_len 2B），向后兼容点对点测试
 #define KFS_FRAME_HEADER_SIZE 6
 
@@ -32,8 +46,13 @@ extern "C" {
 // 单帧负载数据最大长度（受 2B 长度字段限制）
 #define KFS_FRAME_MAX_DATA  0xFFFF
 
-// 单帧总长上限（帧头 + 最大负载；两种帧头取较大者）
+// 单帧总长物理上限（帧头 + 最大负载；两种帧头取较大者）
 #define KFS_FRAME_MAX_TOTAL (KFS_FRAME2_HEADER_SIZE + KFS_FRAME_MAX_DATA)
+
+// 超前输入窗口：玩家 KCP 里可能同时缓存未来多帧输入，用环形缓冲暂存，
+// 容量须 ≥ 输入提前量窗口 K（+ 余量），供服务器按帧号取用。
+#define KFS_PLAYER_BUF 8
+
 
 
 
